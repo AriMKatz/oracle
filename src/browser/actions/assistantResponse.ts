@@ -1218,8 +1218,16 @@ function buildAssistantExtractor(functionName: string): string {
       const textContent = contentRoot?.textContent ?? '';
       const text = innerText.trim().length > 0 ? innerText : textContent;
       const html = contentRoot?.innerHTML ?? '';
-      const messageId = messageRoot.getAttribute('data-message-id');
-      const turnId = messageRoot.getAttribute('data-testid');
+      const messageId =
+        messageRoot.getAttribute('data-message-id') ||
+        messageRoot.querySelector('[data-message-id]')?.getAttribute('data-message-id') ||
+        null;
+      const turnId = messageRoot.getAttribute('data-testid') || turn.getAttribute('data-testid');
+      const modelSlug =
+        messageRoot.getAttribute('data-message-model-slug') ||
+        turn.getAttribute('data-message-model-slug') ||
+        messageRoot.querySelector('[data-message-model-slug]')?.getAttribute('data-message-model-slug') ||
+        null;
       const generatedImages = Array.from(messageRoot.querySelectorAll('img')).filter((img) =>
         String(img?.src || '').includes('/backend-api/estuary/content?id=file_')
       );
@@ -1232,10 +1240,10 @@ function buildAssistantExtractor(functionName: string): string {
         /^(?:reasoning\\s+|pro thinking\\s+)?thought for \\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\\s+edit$/.test(normalizedText);
       if (generatedImages.length > 0 && imageOnlyChrome) {
         const label = generatedImages.length === 1 ? 'Generated image.' : \`Generated \${generatedImages.length} images.\`;
-        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index };
+        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index, modelSlug };
       }
       if (text.trim()) {
-        return { text, html, messageId, turnId, turnIndex: index };
+        return { text, html, messageId, turnId, turnIndex: index, modelSlug };
       }
     }
     return null;
@@ -1568,6 +1576,7 @@ interface AssistantSnapshot {
   messageId?: string | null;
   turnId?: string | null;
   turnIndex?: number | null;
+  modelSlug?: string | null;
   completionVisible?: boolean;
 }
 
@@ -1604,7 +1613,7 @@ const LANGUAGE_TAGS = new Set(
   ].map((token) => token.toLowerCase()),
 );
 
-function cleanAssistantText(text: string): string {
+export function cleanAssistantText(text: string): string {
   const normalized = text.replace(/\u00a0/g, " ");
   const lines = normalized.split(/\r?\n/);
   const filtered = lines.filter((line) => {

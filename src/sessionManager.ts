@@ -84,6 +84,17 @@ export interface BrowserSessionConfig {
   resumeConversationUrl?: string | null;
 }
 
+/** Evidence captured from the exact assistant turn Oracle returned to the caller. */
+export interface BrowserAssistantTurnEvidence {
+  messageId?: string | null;
+  turnId?: string | null;
+  turnIndex?: number | null;
+  modelSlug?: string | null;
+  /** SHA-256 of the returned turn's Markdown after trimming. */
+  responseSha256: string;
+  capturedAt: string;
+}
+
 export interface BrowserRuntimeMetadata {
   browserTransport?: "cdp";
   chromePid?: number;
@@ -99,6 +110,8 @@ export interface BrowserRuntimeMetadata {
   promptSubmitted?: boolean;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
+  /** Identity, model slug, and content hash for the returned assistant turn. */
+  assistantTurn?: BrowserAssistantTurnEvidence;
 }
 
 export type BrowserHarvestState = "running" | "completed" | "stalled" | "detached";

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
@@ -17,6 +18,62 @@ import {
 } from "../../src/browser/index.js";
 import { resolveBrowserConfig } from "../../src/browser/config.js";
 import { BrowserAutomationError } from "../../src/oracle/errors.js";
+
+describe("assistant turn evidence", () => {
+  test("binds the latest turn identity to the final returned Markdown", () => {
+    const responseMarkdown = "refreshed final answer";
+    const evidence = __test__.buildAssistantTurnEvidence(
+      {
+        text: "refreshed final answer",
+        messageId: "message-latest",
+        turnId: "conversation-turn-4",
+        turnIndex: 3,
+        modelSlug: "gpt-5-6-pro",
+      },
+      responseMarkdown,
+      responseMarkdown,
+    );
+
+    expect(evidence).toMatchObject({
+      messageId: "message-latest",
+      turnId: "conversation-turn-4",
+      turnIndex: 3,
+      modelSlug: "gpt-5-6-pro",
+      responseSha256: createHash("sha256").update(responseMarkdown).digest("hex"),
+    });
+    expect(Number.isNaN(Date.parse(evidence?.capturedAt ?? ""))).toBe(false);
+  });
+
+  test("does not pair stale turn evidence with a recovered answer", () => {
+    expect(
+      __test__.buildAssistantTurnEvidence(
+        {
+          text: "earlier incomplete answer",
+          messageId: "message-earlier",
+          turnIndex: 1,
+          modelSlug: "gpt-5-6-pro",
+        },
+        "recovered final answer",
+        "recovered final answer",
+      ),
+    ).toBeUndefined();
+  });
+
+  test("matches the returned answer after removing assistant UI language tags", () => {
+    expect(
+      __test__.buildAssistantTurnEvidence(
+        {
+          text: "Answer\ntypescript\nconst value = 1;",
+          messageId: "message-code",
+          turnIndex: 2,
+          modelSlug: "gpt-5-6-pro",
+        },
+        "Answer\nconst value = 1;",
+        "Answer\n```typescript\nconst value = 1;\n```",
+      ),
+    ).toMatchObject({ messageId: "message-code", modelSlug: "gpt-5-6-pro" });
+  });
+});
 
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {

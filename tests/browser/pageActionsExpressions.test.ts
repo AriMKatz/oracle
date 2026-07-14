@@ -72,7 +72,11 @@ describe("browser automation expressions", () => {
 
     const nestedUser = new FakeElement({ "data-message-author-role": "user" }, "old prompt");
     const nestedAssistant = new FakeElement(
-      { "data-message-author-role": "assistant" },
+      {
+        "data-message-author-role": "assistant",
+        "data-message-id": "message-new",
+        "data-message-model-slug": "gpt-5-6-pro",
+      },
       "old answer",
     );
     const userTurn = new FakeElement({ "data-testid": "conversation-turn-1" }, "old prompt", [
@@ -95,9 +99,19 @@ describe("browser automation expressions", () => {
       "document",
       "HTMLElement",
       `${expression}; return capture();`,
-    )(document, FakeElement) as { text?: string; turnIndex?: number } | null;
+    )(document, FakeElement) as {
+      text?: string;
+      messageId?: string;
+      turnIndex?: number;
+      modelSlug?: string;
+    } | null;
 
-    expect(result).toMatchObject({ text: "old answer", turnIndex: 1 });
+    expect(result).toMatchObject({
+      text: "old answer",
+      messageId: "message-new",
+      turnIndex: 1,
+      modelSlug: "gpt-5-6-pro",
+    });
   });
 
   test("conversation debug expression references conversation selector", () => {

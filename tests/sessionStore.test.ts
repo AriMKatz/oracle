@@ -60,6 +60,27 @@ describe("sessionStore", () => {
     expect(fetched?.options.geminiShowThoughts).toBe(true);
   });
 
+  test("persists exact browser assistant-turn evidence", async () => {
+    const meta = await store.createSession(
+      { prompt: "Persist browser evidence", model: "gpt-5-pro", mode: "browser" },
+      process.cwd(),
+    );
+    const assistantTurn = {
+      messageId: "message-1",
+      turnId: "conversation-turn-2",
+      turnIndex: 1,
+      modelSlug: "gpt-5-6-pro",
+      responseSha256: "a".repeat(64),
+      capturedAt: "2026-07-14T00:00:00.000Z",
+    };
+    await store.updateSession(meta.id, {
+      browser: { runtime: { assistantTurn } },
+    });
+
+    const fetched = await store.readSession(meta.id);
+    expect(fetched?.browser?.runtime?.assistantTurn).toEqual(assistantTurn);
+  });
+
   test("writes per-model logs and aggregates combined log", async () => {
     const meta = await store.createSession(
       {

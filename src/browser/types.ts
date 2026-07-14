@@ -1,6 +1,7 @@
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
+  BrowserAssistantTurnEvidence,
   BrowserModelSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
@@ -167,6 +168,8 @@ export interface BrowserRunResult {
   savedFiles?: SavedBrowserFile[];
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  /** Evidence from the exact assistant turn represented by the returned answer. */
+  assistantTurn?: BrowserAssistantTurnEvidence;
   warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;

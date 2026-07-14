@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -45,6 +46,7 @@ import {
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
+import { cleanAssistantText } from "./actions/assistantResponse.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { startThinkingStatusMonitor } from "./actions/thinkingStatus.js";
 import {
@@ -55,7 +57,10 @@ import {
 } from "./actions/deepResearch.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
-import type { BrowserModelSelectionEvidence } from "../sessionStore.js";
+import type {
+  BrowserAssistantTurnEvidence,
+  BrowserModelSelectionEvidence,
+} from "../sessionStore.js";
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
@@ -614,6 +619,39 @@ export interface BrowserConversationTurn {
   prompt?: string;
   answerText: string;
   answerMarkdown: string;
+  assistantTurn?: BrowserAssistantTurnEvidence;
+}
+
+function buildAssistantTurnEvidence(
+  snapshot: {
+    text?: string | null;
+    messageId?: string | null;
+    turnId?: string | null;
+    turnIndex?: number | null;
+    modelSlug?: string | null;
+  } | null,
+  responseText: string,
+  responseMarkdown: string,
+): BrowserAssistantTurnEvidence | undefined {
+  if (!snapshot) return undefined;
+  const normalizeText = (value: string): string =>
+    cleanAssistantText(value).replace(/\s+/g, " ").trim();
+  if (!snapshot.text || normalizeText(snapshot.text) !== normalizeText(responseText)) {
+    return undefined;
+  }
+  const messageId = snapshot.messageId?.trim() || undefined;
+  const turnId = snapshot.turnId?.trim() || undefined;
+  const turnIndex = typeof snapshot.turnIndex === "number" ? snapshot.turnIndex : undefined;
+  const modelSlug = snapshot.modelSlug?.trim() || undefined;
+  if (!messageId && !turnId && turnIndex === undefined && !modelSlug) return undefined;
+  return {
+    messageId,
+    turnId,
+    turnIndex,
+    modelSlug,
+    responseSha256: createHash("sha256").update(responseMarkdown.trim()).digest("hex"),
+    capturedAt: new Date().toISOString(),
+  };
 }
 
 function normalizeBrowserFollowUpPrompts(values: string[] | undefined): string[] {
@@ -2049,11 +2087,21 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           turnAnswerMarkdown = bestText;
         }
       }
+      const returnedSnapshot = await readAssistantSnapshot(
+        Runtime,
+        baselineTurns ?? undefined,
+        expectedConversationId(),
+      ).catch(() => null);
       return {
         label,
         answerText: turnAnswerText,
         answerMarkdown: turnAnswerMarkdown,
         answerHtml: turnAnswerHtml,
+        assistantTurn: buildAssistantTurnEvidence(
+          returnedSnapshot,
+          turnAnswerText,
+          turnAnswerMarkdown,
+        ),
       };
     };
 
@@ -2193,6 +2241,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       savedFiles: fileArtifacts.savedFiles,
       archive,
       modelSelection: modelSelectionEvidence,
+      assistantTurn: turns[turns.length - 1]?.assistantTurn,
       tookMs: durationMs,
       answerTokens,
       answerChars,
@@ -3490,11 +3539,21 @@ async function runRemoteBrowserMode(
           turnAnswerMarkdown = bestText;
         }
       }
+      const returnedSnapshot = await readAssistantSnapshot(
+        Runtime,
+        baselineTurns ?? undefined,
+        expectedConversationId(),
+      ).catch(() => null);
       return {
         label,
         answerText: turnAnswerText,
         answerMarkdown: turnAnswerMarkdown,
         answerHtml: turnAnswerHtml,
+        assistantTurn: buildAssistantTurnEvidence(
+          returnedSnapshot,
+          turnAnswerText,
+          turnAnswerMarkdown,
+        ),
       };
     };
 
@@ -3641,6 +3700,7 @@ async function runRemoteBrowserMode(
       savedFiles: fileArtifacts.savedFiles,
       archive,
       modelSelection: modelSelectionEvidence,
+      assistantTurn: turns[turns.length - 1]?.assistantTurn,
       controllerPid: process.pid,
     };
   } catch (error) {
@@ -3708,6 +3768,7 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   assertManualLoginProfileReadyForRun,
+  buildAssistantTurnEvidence,
   closeRemoteConnectionAfterRun,
   classifyChatGptUiWarningText,
   collectChatGptUiWarnings,
