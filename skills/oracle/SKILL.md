@@ -6,105 +6,81 @@ description: "Oracle second-model review: bundle prompts/files, debug, refactor,
 # Oracle (CLI) — best use
 
 Oracle bundles a prompt and selected files into a one-shot request so another
-model can answer with real repository context through the API or browser. A
+model can answer with real repository context through the browser. A
 prompt is required; attach files only when they add necessary context. Treat
 responses as advisory and verify them against the codebase and tests.
 
-## Main use case (browser, GPT-5.6)
+## Main use case (browser, GPT-5.6 Pro)
 
-Use browser mode with GPT-5.6 when the ChatGPT account exposes it. GPT-5.6 Sol
-and GPT-5.6 Sol Pro are distinct targets: base Sol uses the Extra High effort
-setting, while Pro is a separate picker target for difficult or long-running
-work.
+Use the installed Oracle fork in browser mode with GPT-5.6 Pro. On macOS, the
+default path launches Stable Chrome against a throwaway copy of `Profile 1`.
 
 Recommended defaults:
 
 - Engine: browser (`--engine browser`)
-- Base Sol: `--model gpt-5.6-sol`
-- Base Sol maximum reasoning: `--browser-thinking-time heavy` (Extra High)
 - Pro: `--model gpt-5-pro`, without a thinking-time flag
-- Fallback: explicitly use `--model gpt-5.5-pro` when GPT-5.6 is unavailable
+- Model strategy: `--browser-model-strategy select`
+- Chrome root: `$HOME/Library/Application Support/Google/Chrome`
+- Chrome profile: `Profile 1`
+- Chrome executable: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+- Archiving: `--browser-archive auto`
 - Attachments: directories/globs plus excludes; never attach secrets by default
 
-GPT-5.6 availability is account-dependent. Confirm the base Sol picker and
-retain model-selection evidence. A bare `Pro` picker label proves picker
-selection but does not, by itself, prove the server-side Pro generation.
+## GPT-5.6 Pro model selection
 
-## GPT-5.6 model selection
+`--model gpt-5-pro` is Oracle's selector for ChatGPT's `Pro` picker target. Do
+not add a thinking-time flag. The picker label alone does not identify the
+server-side Pro version, so the final returned assistant turn must also record
+`data-message-model-slug="gpt-5-6-pro"` in its saved runtime evidence.
 
-This version supports the same aliases in browser and API mode:
-
-- `gpt-5.6`: follow the GPT-5.6 family default
-- `gpt-5.6-sol`: pin ChatGPT's `GPT-5.6 Sol` entry
-- `gpt-5-pro`: select ChatGPT's `Pro` target
-
-For base Sol, use:
-
-```bash
-oracle --engine browser --model gpt-5.6-sol \
-  --browser-thinking-time heavy \
-  -p "<task>" --file "src/**"
-```
-
-Do not use `--model "GPT-5.6 Sol Pro"`. Pro is intentionally handled as a
-distinct picker target. Browser label validation rejects unknown future
-variants such as `gpt-5.6-luna` instead of silently falling back to Sol; API
-runs preserve such provider model IDs unchanged.
-
-Browser mode maps these aliases to ChatGPT's Sol picker. API and multi-model
-runs preserve the corresponding first-party OpenAI model IDs; provider-qualified
-and unrelated custom IDs remain pass-through values.
-
-The GPT-5.6 browser support depends on the unified Intelligence picker. It
-recognizes the current English and Chinese effort labels, avoids matching
-`高` inside `极高`, and re-queries the composer pill after React replaces it so
-selection verification cannot rely on a detached stale node.
-
-## Compatibility with npm 0.15.2
-
-Do not pass `gpt-5.6` or `gpt-5.6-sol` to an unpatched npm 0.15.2 install. That
-release can normalize those labels to `gpt-5.2`. Use the explicit fallback:
-
-```bash
-npx -y @steipete/oracle@0.15.2 --engine browser --model gpt-5.5-pro \
-  -p "<task>" --file "src/**"
-```
-
-After upgrading to a release containing the GPT-5.6 model-selection and
-unified-picker changes, verify all of the following before removing the
-fallback guidance: `--help --verbose` exposes the new options, browser dry-run
-resolves both aliases to GPT-5.6 Sol, API routing selects first-party OpenAI,
-and a live browser run records strict GPT-5.6 selection evidence.
+If picker selection or exact returned-turn verification fails, stop. Do not
+switch models or engines. No preliminary model request is required.
 
 ## Golden path
 
 1. Pick the smallest file set that still contains the truth.
 2. Preview the bundle with `--dry-run` and `--files-report`.
-3. Use browser mode for GPT-5.6; use API only when explicitly intended.
-4. If a run detaches or times out, reattach to the stored session instead of
-   starting a duplicate.
+3. Run the substantive GPT-5.6 Pro request directly through the copied-profile
+   path, or explicitly choose one of the alternate browser paths below.
+4. Verify the saved returned-turn evidence, then read the saved transcript.
 
 ## Commands
 
 - Show help:
-  - `npx -y @steipete/oracle --help --verbose`
+  - `oracle --help --verbose`
 
 - Preview without calling a model:
-  - `npx -y @steipete/oracle --dry-run summary -p "<task>" --file "src/**" --file "!**/*.test.*"`
-  - `npx -y @steipete/oracle --dry-run full -p "<task>" --file "src/**"`
+  - `oracle --dry-run summary -p "<task>" --file "src/**" --file "!**/*.test.*"`
+  - `oracle --dry-run full -p "<task>" --file "src/**"`
 
 - Inspect token usage:
-  - `npx -y @steipete/oracle --dry-run summary --files-report -p "<task>" --file "src/**"`
+  - `oracle --dry-run summary --files-report -p "<task>" --file "src/**"`
 
-- Browser run:
-  - `oracle --engine browser --model gpt-5.6-sol --browser-thinking-time heavy -p "<task>" --file "src/**"`
+- Default macOS browser run:
 
-- Manual paste fallback:
-  - `npx -y @steipete/oracle --render-markdown --copy-markdown -p "<task>" --file "src/**"`
-  - `--render` is an alias for `--render-markdown`.
+```bash
+oracle \
+  --engine browser \
+  --copy-profile "$HOME/Library/Application Support/Google/Chrome" \
+  --browser-chrome-profile "Profile 1" \
+  --browser-chrome-path "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --model gpt-5-pro \
+  --browser-model-strategy select \
+  --browser-archive auto \
+  --browser-timeout 60m \
+  --heartbeat 30 \
+  --slug "<3-5-word-slug>" \
+  -p "<task>"
+```
+
+- Attach to an existing debug-enabled Chrome instead of copying a profile:
+  - `oracle --engine browser --browser-attach-running --model gpt-5-pro --browser-model-strategy select --browser-archive auto -p "<task>"`
+
+- Attach to remote Chrome instead of copying a profile:
+  - `oracle --engine browser --remote-chrome "<host:port>" --model gpt-5-pro --browser-model-strategy select --browser-archive auto -p "<task>"`
 
 - Performance trace:
-  - `npx -y @steipete/oracle --perf-trace --perf-trace-path /tmp/oracle-perf.json --dry-run summary -p "<task>" --file "src/**"`
+  - `oracle --perf-trace --perf-trace-path /tmp/oracle-perf.json --dry-run summary -p "<task>" --file "src/**"`
 
 ## Attaching files
 
@@ -126,41 +102,69 @@ Keep total input under roughly 196k tokens. Use `--files-report` or
 private keys, auth tokens, or other secrets unless they have been redacted and
 are essential to the question.
 
-## Engines and browser controls
+## Browser controls
 
-- Auto-selection uses API when `OPENAI_API_KEY` is set and browser otherwise.
-- Browser supports GPT models through ChatGPT and Gemini models through Gemini
-  web. API-only models include `gpt-5.1-codex`.
-- Current model families include GPT-5.5/5.4/5.2/5.1, Gemini 3.x, and Claude
-  4.x; availability depends on engine and provider.
-- API runs require explicit user consent because they may incur usage costs.
 - Browser attachments use `--browser-attachments auto|never|always`.
 - For many files, add `--browser-bundle-files --browser-bundle-format auto|zip`.
-- Reuse an existing Chrome session with `--browser-tab <ref>`,
-  `--browser-attach-running`, or `--remote-chrome <host:port>`.
-- Use `--browser-model-strategy select|current|ignore` to control picker
-  behavior.
+- The default copied-profile path uses Stable Chrome `Profile 1`.
+- `--copy-profile` cannot be combined with `--browser-attach-running`,
+  `--remote-chrome`, `--remote-host`, `--browser-manual-login`, or
+  `--browser-keep-browser`.
+- Use `--browser-attach-running`, optionally with `--browser-tab <ref>`, to
+  reuse a debug-enabled local Chrome.
+- Use `--remote-chrome <host:port>` to reuse remote Chrome.
+- New conversations use `--browser-model-strategy select`.
 - Use `--browser-follow-up "<prompt>"` for another turn in the same browser
-  conversation, or `--followup <sessionId|responseId>` for a stored run.
+  conversation.
 - Use `--browser-research deep` only when Deep Research is explicitly wanted.
+- Deep Research cannot be combined with browser follow-ups.
+- Browser attachments, bundled files, same-run follow-ups, and Deep Research
+  still require exact evidence for the final returned turn.
 
-## API preflight
+## GPT-5.6 Pro verification and saved output
 
-Before an API run, check provider readiness without printing secrets:
+Use the exact id printed as `Session: <id>`.
+
+For a new conversation:
 
 ```bash
-oracle doctor --providers --models gpt-5.4,claude-4.6-sonnet,gemini-3-pro
-oracle --preflight --models gpt-5.4,gemini-3-pro
-oracle --route --model gpt-5.4
+SESSION_ID="<exact-session-id>"
+jq -e '
+  .status == "completed" and
+  .browser.modelSelection.requestedModel == "Pro" and
+  .browser.modelSelection.strategy == "select" and
+  .browser.modelSelection.verified == true and
+  .browser.runtime.assistantTurn.modelSlug == "gpt-5-6-pro" and
+  ((.browser.runtime.assistantTurn.messageId // .browser.runtime.assistantTurn.turnId // "") | length > 0) and
+  (.browser.runtime.assistantTurn.turnIndex | type == "number") and
+  (.browser.runtime.assistantTurn.responseSha256 | test("^[0-9a-f]{64}$"))
+' "${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$SESSION_ID/meta.json"
 ```
 
-Use `--provider openai` or `--no-azure` when first-party OpenAI routing is
-required. For multi-model panels where partial success is useful, use
-`--allow-partial --write-output <path>` so successful outputs and the manifest
-can be recovered.
+A completed stored `--followup` intentionally skips the picker. Its parent must
+already have passed the new-conversation check, and its new returned turn must
+pass:
 
-Set an explicit deadline for automation, for example `--timeout 10m`; Oracle
-derives the HTTP timeout unless `--http-timeout` is supplied.
+```bash
+SESSION_ID="<exact-followup-session-id>"
+jq -e '
+  .status == "completed" and
+  ((.options.followupSessionId // "") | length > 0) and
+  .browser.modelSelection.requestedModel == "Pro" and
+  .browser.modelSelection.status == "skipped" and
+  .browser.runtime.assistantTurn.modelSlug == "gpt-5-6-pro" and
+  ((.browser.runtime.assistantTurn.messageId // .browser.runtime.assistantTurn.turnId // "") | length > 0) and
+  (.browser.runtime.assistantTurn.turnIndex | type == "number") and
+  (.browser.runtime.assistantTurn.responseSha256 | test("^[0-9a-f]{64}$"))
+' "${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$SESSION_ID/meta.json"
+```
+
+Read the saved answer without inspecting the browser page:
+
+```bash
+sed -n '/^## Answer$/,$p' \
+  "${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$SESSION_ID/artifacts/transcript.md"
+```
 
 ## Sessions and recovery
 
@@ -169,10 +173,17 @@ derives the HTTP timeout unless `--http-timeout` is supplied.
 - Browser artifacts include `transcript.md` and, when available, research
   reports and generated images.
 - List recent sessions with `oracle status --hours 72`.
-- Attach with `oracle session <id> --render`.
+- Use `oracle session <id> --render` to replay a completed session or reattach
+  an eligible incomplete run.
+- Continue a completed browser conversation with
+  `oracle --followup <completed-session-id> -p "<task>"`. A completed
+  copied-profile session launches a fresh copy from its stored source
+  configuration.
+- An incomplete copied-profile run cannot be reattached because its throwaway
+  Chrome copy is deleted.
+- An incomplete attach-running or remote-Chrome run can be reattached when its
+  saved runtime metadata still identifies a usable Chrome session.
 - Use `--slug "<3-5 words>"` for readable session IDs.
-- If a run times out, reattach; do not re-run it. Use `--force` only when a
-  genuinely new identical run is intended.
 - Successful non-project browser one-shots are archived automatically by
   default; override with `--browser-archive never|always`.
 
