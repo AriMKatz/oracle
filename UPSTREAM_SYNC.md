@@ -72,7 +72,11 @@ The fork owns the local execution contract:
   configuration is required;
 - compatible controls such as attachments, attach-running Chrome, remote
   Chrome, follow-ups, replay, research, and archiving remain available as
-  explicit choices rather than automatic fallbacks.
+  explicit choices rather than automatic fallbacks;
+- distinct copied-profile browser reviews may run concurrently, and an
+  unrelated running session never requires waiting, serialization, or reuse;
+- API-oriented CLI guidance does not govern browser-session concurrency or
+  alter the installed skill's browser-only procedure.
 
 The installed skill also carries the user's standing informed consent for the
 external upload performed by each explicit Oracle invocation. That consent is
@@ -109,6 +113,14 @@ controls.
 The underlying upstream program may retain capabilities such as API mode. The
 local browser-only rule governs the installed skill's default procedure; it
 does not require deleting unrelated upstream capabilities from the codebase.
+
+Keep the browser-concurrency rule in the installed skill as an executor-side
+requirement, never as Oracle prompt content. Reattach or follow up only when
+continuing the same logical review. Treat an identical-prompt guard or a
+concrete shared-browser conflict as scoped to that prompt or resource; never
+infer a global prohibition on distinct browser sessions. In particular,
+upstream help that warns against starting another API run does not require
+serializing independent browser reviews.
 
 ### Deployment authority
 
@@ -208,6 +220,8 @@ Reject an upstream effect—or omit that part of a mixed change—when it would:
 - remove or weaken the installed skill's standing informed external-upload
   consent contract, or move that consent into an Oracle prompt or attached
   review context;
+- serialize distinct browser reviews solely because another Oracle session is
+  running, or reinterpret API-specific guidance as a browser concurrency ban;
 - create important behavior that is absent from the canonical fork.
 
 Security fixes must not be rejected merely because they touch protected code.

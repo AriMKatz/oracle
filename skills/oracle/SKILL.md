@@ -80,6 +80,27 @@ and must also satisfy the stricter redaction-and-necessity rule under
 **Attaching files**. If a higher-level safety control still rejects the export,
 stop and report its rejection exactly. Do not work around or circumvent it.
 
+## Concurrent browser sessions
+
+Allow distinct browser-mode Oracle reviews to run concurrently. Do not wait,
+serialize work, reuse a session, or attach an unrelated task merely because
+`oracle status` shows another running session. Default `--copy-profile` runs
+use independent throwaway Chrome profiles.
+
+Reattach or use a follow-up only to continue the same logical review. Treat the
+duplicate-prompt guard as applying to an identical in-flight prompt, not to a
+different review.
+
+Treat CLI guidance about avoiding new API runs while a session is active as
+API-specific. It does not restrict browser-session concurrency. This skill does
+not use API mode; do not let API-related CLI guidance alter this browser-only
+procedure, and never switch to API mode as a fallback.
+
+For attach-running, remote-Chrome, or explicit same-tab operation, avoid an
+actual tab or browser-resource collision. If Oracle reports a concrete
+conflict, report that exact error; do not infer a global concurrency
+prohibition.
+
 ## Commands
 
 - Show help:
