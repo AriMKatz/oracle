@@ -68,13 +68,27 @@ export async function archiveChatGptConversation(
   {
     mode,
     conversationUrl,
+    expectedConversationId,
   }: {
     mode: BrowserArchiveMode;
     conversationUrl?: string | null;
+    expectedConversationId?: string;
   },
 ): Promise<BrowserArchiveResult> {
+  const pinnedConversationId =
+    expectedConversationId?.trim() || extractArchiveConversationId(conversationUrl);
+  if (!pinnedConversationId) {
+    logger("[browser] ChatGPT archive skipped (missing-conversation-id).");
+    return {
+      mode,
+      attempted: false,
+      archived: false,
+      reason: "missing-conversation-id",
+      conversationUrl: conversationUrl ?? undefined,
+    };
+  }
   const evaluated = await Runtime.evaluate({
-    expression: buildArchiveConversationExpression(),
+    expression: buildArchiveConversationExpression(pinnedConversationId),
     awaitPromise: true,
     returnByValue: true,
   });
@@ -101,13 +115,30 @@ export async function archiveChatGptConversation(
   };
 }
 
-export function buildArchiveConversationExpressionForTest(): string {
-  return buildArchiveConversationExpression();
+function extractArchiveConversationId(url?: string | null): string | undefined {
+  try {
+    const parsed = new URL(url ?? "");
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname !== "chatgpt.com" && hostname !== "chat.openai.com") return undefined;
+    const match = parsed.pathname.match(/^\/c\/([^/?#]+)(?:[/?#]|$)/);
+    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-function buildArchiveConversationExpression(): string {
+export function buildArchiveConversationExpressionForTest(expectedConversationId?: string): string {
+  return buildArchiveConversationExpression(expectedConversationId);
+}
+
+function buildArchiveConversationExpression(expectedConversationId?: string): string {
   return `(() => {
     const conversationUrl = typeof location === 'object' ? location.href : null;
+    const expectedConversationId = ${JSON.stringify(expectedConversationId ?? null)};
+    const currentConversationId = () =>
+      String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null;
+    const isExpectedConversation = () =>
+      Boolean(expectedConversationId) && currentConversationId() === expectedConversationId;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const normalize = (value) =>
       String(value ?? '')
@@ -127,6 +158,7 @@ function buildArchiveConversationExpression(): string {
         element.textContent,
       ].filter(Boolean).join(' '));
 	    const click = (element) => {
+	      if (!isExpectedConversation()) return false;
 	      const rect = element.getBoundingClientRect();
 	      const eventInit = {
 	        bubbles: true,
@@ -157,6 +189,7 @@ function buildArchiveConversationExpression(): string {
 	      }
 	      element.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, buttons: 0 }));
 	      element.dispatchEvent(new MouseEvent('click', { ...eventInit, buttons: 0 }));
+	      return true;
 	    };
     const findConversationMenuButton = () => {
       const buttons = Array.from(document.querySelectorAll('button,[role="button"]'))
@@ -239,29 +272,38 @@ function buildArchiveConversationExpression(): string {
 	    const verifyArchivedStateFromMenu = async () => {
 	      const menuButton = findConversationMenuButton();
 	      if (!menuButton) return false;
-	      click(menuButton);
+	      if (!click(menuButton)) return false;
 	      await sleep(300);
 	      const archived = hasUnarchiveMenuItem();
 	      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 	      return archived;
 	    };
 	    return (async () => {
+	      if (!isExpectedConversation()) {
+	        return { status: 'skipped', reason: 'conversation-changed', conversationUrl };
+	      }
 	      const menuButton = findConversationMenuButton();
       if (!menuButton) {
         return { status: 'skipped', reason: 'conversation-menu-not-found', conversationUrl };
       }
-      click(menuButton);
+      if (!click(menuButton)) {
+        return { status: 'skipped', reason: 'conversation-changed', conversationUrl };
+      }
       await sleep(350);
       const archiveItem = findArchiveMenuItem();
       if (!archiveItem) {
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         return { status: 'skipped', reason: 'archive-menu-item-not-found', conversationUrl };
 	      }
-	      click(archiveItem);
+	      if (!click(archiveItem)) {
+	        return { status: 'skipped', reason: 'conversation-changed', conversationUrl };
+	      }
 	      await sleep(350);
 	      const confirmButton = findArchiveConfirmationButton();
 	      if (confirmButton) {
-	        click(confirmButton);
+	        if (!click(confirmButton)) {
+	          return { status: 'skipped', reason: 'conversation-changed', conversationUrl };
+	        }
 	        await sleep(500);
 	      }
 	      if (await waitForArchiveConfirmation()) {

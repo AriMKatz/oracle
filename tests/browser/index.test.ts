@@ -75,6 +75,154 @@ describe("assistant turn evidence", () => {
   });
 });
 
+describe("Deep Research submission scope", () => {
+  test("freezes the first observed post-submit conversation ID", () => {
+    expect(__test__.acceptsSubmittedConversationId(undefined, "submitted")).toBe(true);
+    expect(__test__.acceptsSubmittedConversationId("submitted", "submitted")).toBe(true);
+    expect(__test__.acceptsSubmittedConversationId("submitted", "other")).toBe(false);
+  });
+});
+
+describe("Deep Research answer fields", () => {
+  test("carries exact-turn evidence through the early completion return", () => {
+    const text = "# Report\n\n[1](<https://example.com/source>)";
+    const assistantTurn = {
+      messageId: "message-deep",
+      finalMessageId: "message-deep-final",
+      turnId: "conversation-turn-8",
+      turnIndex: 7,
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record" as const,
+      responseSha256: createHash("sha256").update(text).digest("hex"),
+      capturedAt: "2026-07-15T00:00:00.000Z",
+    };
+
+    expect(
+      __test__.buildDeepResearchAnswerFields({
+        text,
+        meta: assistantTurn,
+        assistantTurn,
+        citationStatus: { total: 1, linked: 1, missingIndexes: [] },
+      }),
+    ).toEqual({
+      answerText: text,
+      answerMarkdown: text,
+      answerHtml: undefined,
+      assistantTurn,
+      citationStatus: { total: 1, linked: 1, missingIndexes: [] },
+      warnings: undefined,
+    });
+  });
+
+  test("returns the report but warns when exact provenance is unavailable", () => {
+    const result = __test__.buildDeepResearchAnswerFields({
+      text: "Report still preserved",
+      meta: {},
+    });
+
+    expect(result.answerMarkdown).toBe("Report still preserved");
+    expect(result.assistantTurn).toBeUndefined();
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "browser-deep-research-provenance-incomplete" }),
+        expect.objectContaining({ code: "browser-deep-research-citations-incomplete" }),
+      ]),
+    );
+  });
+
+  test("warns without guessing when an interactive citation destination is unresolved", () => {
+    const text = "Report citation [1](<https://example.com/one>) [2]";
+    const assistantTurn = {
+      messageId: "message-deep",
+      finalMessageId: "message-deep-final",
+      turnId: "conversation-turn-8",
+      turnIndex: 7,
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record" as const,
+      responseSha256: createHash("sha256").update(text).digest("hex"),
+      capturedAt: "2026-07-15T00:00:00.000Z",
+    };
+    const result = __test__.buildDeepResearchAnswerFields({
+      text,
+      meta: assistantTurn,
+      assistantTurn,
+      citationStatus: { total: 2, linked: 1, missingIndexes: [2] },
+    });
+
+    expect(result.answerMarkdown).toBe(text);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-citations-incomplete",
+        details: { total: 2, linked: 1, missingIndexes: [2] },
+      }),
+    ]);
+  });
+
+  test("warns when the stored report hash does not match the exact returned report", () => {
+    const text = "Exact report body";
+    const assistantTurn = {
+      messageId: "message-deep",
+      finalMessageId: "message-deep",
+      turnIndex: 7,
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record" as const,
+      responseSha256: createHash("sha256").update("different report").digest("hex"),
+      capturedAt: "2026-07-15T00:00:00.000Z",
+    };
+    const result = __test__.buildDeepResearchAnswerFields({
+      text,
+      meta: assistantTurn,
+      assistantTurn,
+      citationStatus: { total: 0, linked: 0, missingIndexes: [] },
+    });
+
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-provenance-incomplete",
+        details: expect.objectContaining({ mismatchedFields: ["responseSha256"] }),
+      }),
+    ]);
+  });
+
+  test("requires exact selected/default Pro while preserving owner model identity", () => {
+    const text = "Exact report body";
+    const assistantTurn = {
+      messageId: "message-deep",
+      finalMessageId: "message-deep",
+      turnIndex: 7,
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-5-instant",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record" as const,
+      responseSha256: createHash("sha256").update(text).digest("hex"),
+      capturedAt: "2026-07-15T00:00:00.000Z",
+    };
+    const result = __test__.buildDeepResearchAnswerFields({
+      text,
+      meta: assistantTurn,
+      assistantTurn,
+      citationStatus: { total: 0, linked: 0, missingIndexes: [] },
+    });
+
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-provenance-incomplete",
+        details: expect.objectContaining({ mismatchedFields: ["defaultModelSlug"] }),
+      }),
+    ]);
+  });
+});
+
 describe("shouldPreserveBrowserOnErrorForTest", () => {
   test("preserves the browser for headful cloudflare challenge errors", () => {
     const error = new BrowserAutomationError("Cloudflare challenge detected.", {
@@ -97,11 +245,18 @@ describe("shouldPreserveBrowserOnErrorForTest", () => {
     const recheck = new BrowserAutomationError("assistant recheck failed", {
       stage: "assistant-recheck",
     });
+    const deepResearchTimeout = new BrowserAutomationError("deep research timed out", {
+      stage: "deep-research-timeout",
+    });
 
     expect(shouldPreserveBrowserOnErrorForTest(timeout, false)).toBe(true);
     expect(shouldPreserveBrowserOnErrorForTest(recheck, false)).toBe(true);
+    expect(shouldPreserveBrowserOnErrorForTest(deepResearchTimeout, false)).toBe(true);
     expect(classifyPreservedBrowserErrorForTest(timeout, false)).toBe("reattachable-capture");
     expect(classifyPreservedBrowserErrorForTest(recheck, false)).toBe("reattachable-capture");
+    expect(classifyPreservedBrowserErrorForTest(deepResearchTimeout, false)).toBe(
+      "reattachable-capture",
+    );
   });
 
   test("does not preserve assistant capture errors in headless mode", () => {
@@ -515,6 +670,33 @@ describe("browser conversation archiving", () => {
     });
     expect(runtime.evaluate).not.toHaveBeenCalled();
   });
+
+  test("does not archive a different conversation after a pinned report completes", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: { value: "https://chatgpt.com/c/other" },
+      }),
+    };
+    const log = vi.fn();
+
+    await expect(
+      maybeArchiveCompletedConversationForTest({
+        Runtime: runtime as never,
+        logger: log as never,
+        config: resolveBrowserConfig({ archiveConversations: "always" }),
+        conversationUrl: "https://chatgpt.com/c/submitted",
+        followUpCount: 0,
+        requiredArtifactsSaved: true,
+      }),
+    ).resolves.toMatchObject({
+      mode: "always",
+      attempted: false,
+      archived: false,
+      reason: "conversation-changed",
+      conversationUrl: "https://chatgpt.com/c/submitted",
+    });
+    expect(runtime.evaluate).toHaveBeenCalledOnce();
+  });
 });
 
 describe("remote Chrome option warnings", () => {
@@ -701,6 +883,7 @@ describe("runSubmissionWithRecoveryForTest", () => {
     ).resolves.toEqual({
       baselineTurns: 7,
       baselineAssistantText: "done",
+      submittedPrompt: "fallback prompt",
     });
 
     expect(reloadPromptComposer).toHaveBeenCalledTimes(1);

@@ -51,10 +51,13 @@ import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { startThinkingStatusMonitor } from "./actions/thinkingStatus.js";
 import {
   activateDeepResearch,
-  captureDeepResearchTargetKeys,
+  captureDeepResearchTargetBaseline as captureDeepResearchTargetBaselineSnapshot,
+  type DeepResearchTargetBaseline,
   waitForDeepResearchCompletion,
+  waitForDeepResearchSubmittedUserTurn,
   waitForResearchPlanAutoConfirm,
 } from "./actions/deepResearch.js";
+import { buildDeepResearchAnswerFields } from "./deepResearchAnswer.js";
 import { estimateTokenCount, withRetries, delay } from "./utils.js";
 import { formatElapsed } from "../oracle/format.js";
 import type {
@@ -148,7 +151,11 @@ function isCloudflareChallengeError(error: unknown): error is BrowserAutomationE
 function isReattachableCaptureError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
   const stage = (error.details as { stage?: string } | undefined)?.stage;
-  return stage === "assistant-timeout" || stage === "assistant-recheck";
+  return (
+    stage === "assistant-timeout" ||
+    stage === "assistant-recheck" ||
+    stage === "deep-research-timeout"
+  );
 }
 
 type PreservedBrowserErrorKind = "cloudflare-challenge" | "reattachable-capture";
@@ -692,6 +699,7 @@ async function maybeArchiveCompletedConversation({
   logger,
   config,
   conversationUrl,
+  expectedConversationId,
   followUpCount,
   requiredArtifactsSaved,
 }: {
@@ -699,6 +707,7 @@ async function maybeArchiveCompletedConversation({
   logger: BrowserLogger;
   config: ResolvedBrowserConfig;
   conversationUrl?: string | null;
+  expectedConversationId?: string;
   followUpCount: number;
   requiredArtifactsSaved: boolean;
 }): Promise<BrowserArchiveResult> {
@@ -729,9 +738,41 @@ async function maybeArchiveCompletedConversation({
       conversationUrl: conversationUrl ?? undefined,
     };
   }
+  const pinnedConversationId =
+    expectedConversationId?.trim() ||
+    (conversationUrl ? extractConversationIdFromUrl(conversationUrl) : undefined);
+  if (!pinnedConversationId) {
+    logger("[browser] ChatGPT archive skipped (missing-conversation-id).");
+    return {
+      mode: decision.mode,
+      attempted: false,
+      archived: false,
+      reason: "missing-conversation-id",
+      conversationUrl: conversationUrl ?? undefined,
+    };
+  }
+  const currentConversationId = await Runtime.evaluate({
+    expression: "location.href",
+    returnByValue: true,
+  })
+    .then(({ result }) =>
+      typeof result?.value === "string" ? extractConversationIdFromUrl(result.value) : undefined,
+    )
+    .catch(() => undefined);
+  if (currentConversationId !== pinnedConversationId) {
+    logger("[browser] ChatGPT archive skipped (conversation-changed).");
+    return {
+      mode: decision.mode,
+      attempted: false,
+      archived: false,
+      reason: "conversation-changed",
+      conversationUrl: conversationUrl ?? undefined,
+    };
+  }
   return archiveChatGptConversation(Runtime, logger, {
     mode: decision.mode,
     conversationUrl,
+    expectedConversationId: pinnedConversationId,
   }).catch((error) => {
     const message = error instanceof Error ? error.message : String(error);
     logger(`[browser] ChatGPT archive failed (${message}).`);
@@ -752,24 +793,36 @@ export function maybeArchiveCompletedConversationForTest(
   return maybeArchiveCompletedConversation(args);
 }
 
-type BrowserSubmissionResult = {
+type BrowserSubmissionAttemptResult = {
   baselineTurns: number | null;
   baselineAssistantText: string | null;
-  deepResearchTargetKeys?: string[];
+  deepResearchTargetBaseline?: DeepResearchTargetBaseline[];
   deepResearchTargetBaselineCaptured?: boolean;
 };
+
+type BrowserSubmissionResult = BrowserSubmissionAttemptResult & { submittedPrompt: string };
 
 async function captureDeepResearchTargetBaseline(
   client: ChromeClient,
   logger: BrowserLogger,
-): Promise<{ targetKeys: string[]; captured: boolean }> {
+): Promise<{ targetBaseline: DeepResearchTargetBaseline[]; captured: boolean }> {
   try {
-    return { targetKeys: await captureDeepResearchTargetKeys(client), captured: true };
-  } catch {
+    return {
+      targetBaseline: await captureDeepResearchTargetBaselineSnapshot(client),
+      captured: true,
+    };
+  } catch (error) {
     logger(
-      "[browser] Deep Research target baseline unavailable; retaining conversation-turn owner scoping.",
+      "[browser] Deep Research target baseline unavailable; refusing to submit an unverifiable run.",
     );
-    return { targetKeys: [], captured: false };
+    throw new BrowserAutomationError(
+      "Deep Research target baseline capture failed before submission; refusing to start an unverifiable run.",
+      {
+        stage: "deep-research-scope",
+        code: "deep-research-target-baseline-unavailable",
+      },
+      error,
+    );
   }
 }
 
@@ -790,7 +843,10 @@ async function runSubmissionWithRecovery({
   prompt: string;
   attachments: BrowserAttachment[];
   fallbackSubmission?: BrowserSubmissionFallback;
-  submit: (prompt: string, attachments: BrowserAttachment[]) => Promise<BrowserSubmissionResult>;
+  submit: (
+    prompt: string,
+    attachments: BrowserAttachment[],
+  ) => Promise<BrowserSubmissionAttemptResult>;
   reloadPromptComposer: () => Promise<void>;
   prepareFallbackSubmission: () => Promise<void>;
   logger: BrowserLogger;
@@ -802,7 +858,10 @@ async function runSubmissionWithRecovery({
 
   while (true) {
     try {
-      return await submit(currentPrompt, currentAttachments);
+      return {
+        ...(await submit(currentPrompt, currentAttachments)),
+        submittedPrompt: currentPrompt,
+      };
     } catch (error) {
       const isDeadComposer = hasBrowserErrorCode(error, "dead-composer");
       if (isDeadComposer && !retriedDeadComposer) {
@@ -830,7 +889,10 @@ export async function runSubmissionWithRecoveryForTest(args: {
   prompt: string;
   attachments: BrowserAttachment[];
   fallbackSubmission?: BrowserSubmissionFallback;
-  submit: (prompt: string, attachments: BrowserAttachment[]) => Promise<BrowserSubmissionResult>;
+  submit: (
+    prompt: string,
+    attachments: BrowserAttachment[],
+  ) => Promise<BrowserSubmissionAttemptResult>;
   reloadPromptComposer: () => Promise<void>;
   prepareFallbackSubmission: () => Promise<void>;
   logger: BrowserLogger;
@@ -911,6 +973,13 @@ function buildSkippedModelSelectionEvidence(
   };
 }
 
+function acceptsSubmittedConversationId(
+  submittedConversationId: string | undefined,
+  candidateConversationId: string,
+): boolean {
+  return !submittedConversationId || submittedConversationId === candidateConversationId;
+}
+
 export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
   const promptText = options.prompt?.trim();
   if (!promptText) {
@@ -950,6 +1019,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
   let promptSubmitted = false;
+  let submittedConversationUrl: string | undefined;
+  let submittedConversationId: string | undefined;
+  let submittedUserMessageId: string | undefined;
+  let submittedUserTurnIndex: number | undefined;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
@@ -957,15 +1030,20 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (!chrome?.port) {
       return;
     }
-    const conversationId = lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
+    const runtimeUrl = submittedConversationUrl ?? lastUrl;
+    const conversationId =
+      submittedConversationId ??
+      (runtimeUrl ? extractConversationIdFromUrl(runtimeUrl) : undefined);
     const hint = {
       chromePid: chrome.pid,
       chromePort: chrome.port,
       chromeHost,
       chromeTargetId: lastTargetId,
-      tabUrl: lastUrl,
+      tabUrl: runtimeUrl,
       conversationId,
       promptSubmitted,
+      submittedUserMessageId,
+      submittedUserTurnIndex,
       userDataDir,
       controllerPid: process.pid,
     };
@@ -975,7 +1053,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         chromeHost,
         chromePort: chrome.port,
         chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
+        tabUrl: runtimeUrl,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -988,7 +1066,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     promptSubmitted = true;
     await emitRuntimeHint();
-    void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    if (config.researchMode === "deep") {
+      const captured = await conversationUrlMonitor?.update("post-submit", 15_000);
+      if (!captured || !submittedConversationId) {
+        throw new BrowserAutomationError(
+          "Deep Research submission did not produce a stable ChatGPT conversation URL.",
+          { stage: "deep-research-scope", code: "deep-research-conversation-unavailable" },
+        );
+      }
+    } else {
+      void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    }
   };
   if (config.debug || process.env.CHATGPT_DEVTOOLS_TRACE === "1") {
     logger(
@@ -1423,6 +1511,19 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         return typeof result?.value === "string" ? result.value : null;
       },
       persistUrl: async (url) => {
+        const conversationId = extractConversationIdFromUrl(url);
+        if (promptSubmitted && config.researchMode === "deep") {
+          if (!conversationId) return;
+          if (!submittedConversationId) {
+            submittedConversationId = conversationId;
+            submittedConversationUrl = url;
+          } else if (!acceptsSubmittedConversationId(submittedConversationId, conversationId)) {
+            logger(
+              `[browser] Ignoring conversation URL change after Deep Research submission (${submittedConversationId} -> ${conversationId}).`,
+            );
+            return;
+          }
+        }
         lastUrl = url;
         await emitRuntimeHint();
       },
@@ -1626,7 +1727,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       return {
         baselineTurns,
         baselineAssistantText,
-        deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
+        deepResearchTargetBaseline: deepResearchTargetBaseline?.targetBaseline,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
     };
@@ -1638,7 +1739,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
 
     let baselineTurns: number | null = null;
     let baselineAssistantText: string | null = null;
-    let deepResearchTargetKeys: string[] = [];
+    let submittedPrompt = promptText;
+    let deepResearchTargetBaseline: DeepResearchTargetBaseline[] = [];
     let deepResearchTargetBaselineCaptured = false;
     await acquireProfileLockIfNeeded();
     try {
@@ -1657,25 +1759,50 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       });
       baselineTurns = submission.baselineTurns;
       baselineAssistantText = submission.baselineAssistantText;
-      deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
+      submittedPrompt = submission.submittedPrompt;
+      deepResearchTargetBaseline = submission.deepResearchTargetBaseline ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
       await releaseProfileLockIfHeld();
     }
     const imageArtifactMinTurnIndex = baselineTurns;
     if (deepResearch) {
+      const expectedConversationId = submittedConversationId;
+      if (!expectedConversationId) {
+        throw new BrowserAutomationError(
+          "Deep Research submission did not produce a stable ChatGPT conversation URL.",
+          {
+            stage: "deep-research-scope",
+            code: "deep-research-conversation-unavailable",
+          },
+        );
+      }
+      const pinnedConversationUrl = submittedConversationUrl;
+      const submittedUserTurn = await raceWithDisconnect(
+        waitForDeepResearchSubmittedUserTurn(
+          Runtime,
+          expectedConversationId,
+          baselineTurns,
+          submittedPrompt,
+        ),
+      );
+      submittedUserMessageId = submittedUserTurn.messageId;
+      submittedUserTurnIndex = submittedUserTurn.turnIndex;
+      await emitRuntimeHint();
       await raceWithDisconnect(waitForResearchPlanAutoConfirm(Runtime, logger));
       const researchResult = await raceWithDisconnect(
         waitForDeepResearchCompletion(
           Runtime,
           logger,
           config.timeoutMs,
-          baselineTurns,
+          submittedUserTurn.turnIndex,
           Page,
           client,
           {
-            ignoredTargetKeys: deepResearchTargetKeys,
+            targetBaseline: deepResearchTargetBaseline,
             targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+            expectedConversationId,
+            expectedUserMessageId: submittedUserTurn.messageId,
           },
         ),
       );
@@ -1688,7 +1815,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           saveDeepResearchReportArtifact({
             sessionId: options.sessionId,
             reportMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
+            conversationUrl: pinnedConversationUrl,
             logger,
           }),
         logger,
@@ -1699,7 +1826,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             sessionId: options.sessionId,
             prompt: promptText,
             answerMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
+            conversationUrl: pinnedConversationUrl,
             artifacts: appendArtifacts(undefined, [reportArtifact]),
             logger,
           }),
@@ -1710,14 +1837,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         Runtime,
         logger,
         config,
-        conversationUrl: lastUrl,
+        conversationUrl: pinnedConversationUrl,
+        expectedConversationId,
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
       return {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-        answerHtml: researchResult.html,
+        ...buildDeepResearchAnswerFields(researchResult),
         artifacts: savedArtifacts,
         archive,
         modelSelection: modelSelectionEvidence,
@@ -1729,9 +1855,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         chromeHost,
         userDataDir,
         chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+        tabUrl: pinnedConversationUrl,
+        conversationId: expectedConversationId,
         promptSubmitted,
+        submittedUserMessageId,
+        submittedUserTurnIndex,
         controllerPid: process.pid,
       };
     }
@@ -1824,9 +1952,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               chromeHost,
               userDataDir,
               chromeTargetId: lastTargetId,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+              tabUrl: submittedConversationUrl ?? lastUrl,
+              conversationId:
+                submittedConversationId ??
+                ((submittedConversationUrl ?? lastUrl)
+                  ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                  : undefined),
               promptSubmitted,
+              submittedUserMessageId,
+              submittedUserTurnIndex,
               controllerPid: process.pid,
             },
           },
@@ -1913,9 +2047,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               chromeHost,
               userDataDir,
               chromeTargetId: lastTargetId,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+              tabUrl: submittedConversationUrl ?? lastUrl,
+              conversationId:
+                submittedConversationId ??
+                ((submittedConversationUrl ?? lastUrl)
+                  ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                  : undefined),
               promptSubmitted,
+              submittedUserMessageId,
+              submittedUserTurnIndex,
               controllerPid: process.pid,
             };
             throw await createAssistantTimeoutError({
@@ -2178,9 +2318,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             chromeHost,
             userDataDir,
             chromeTargetId: lastTargetId,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+            tabUrl: submittedConversationUrl ?? lastUrl,
+            conversationId:
+              submittedConversationId ??
+              ((submittedConversationUrl ?? lastUrl)
+                ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                : undefined),
             promptSubmitted,
+            submittedUserMessageId,
+            submittedUserTurnIndex,
             controllerPid: process.pid,
           },
         }),
@@ -2250,9 +2396,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromeHost,
       userDataDir,
       chromeTargetId: lastTargetId,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      tabUrl: submittedConversationUrl ?? lastUrl,
+      conversationId:
+        submittedConversationId ??
+        ((submittedConversationUrl ?? lastUrl)
+          ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+          : undefined),
       promptSubmitted,
+      submittedUserMessageId,
+      submittedUserTurnIndex,
       controllerPid: process.pid,
     };
   } catch (error) {
@@ -2278,8 +2430,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         chromeHost,
         userDataDir,
         chromeTargetId: lastTargetId,
-        tabUrl: lastUrl,
+        tabUrl: submittedConversationUrl ?? lastUrl,
+        conversationId:
+          submittedConversationId ??
+          ((submittedConversationUrl ?? lastUrl)
+            ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+            : undefined),
         promptSubmitted,
+        submittedUserMessageId,
+        submittedUserTurnIndex,
         controllerPid: process.pid,
       };
       const reuseProfileHint =
@@ -2336,8 +2495,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           chromeHost,
           userDataDir,
           chromeTargetId: lastTargetId,
-          tabUrl: lastUrl,
+          tabUrl: submittedConversationUrl ?? lastUrl,
+          conversationId:
+            submittedConversationId ??
+            ((submittedConversationUrl ?? lastUrl)
+              ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+              : undefined),
           promptSubmitted,
+          submittedUserMessageId,
+          submittedUserTurnIndex,
           controllerPid: process.pid,
         },
       },
@@ -2810,6 +2976,10 @@ async function runRemoteBrowserMode(
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
   let promptSubmitted = false;
+  let submittedConversationUrl: string | undefined;
+  let submittedConversationId: string | undefined;
+  let submittedUserMessageId: string | undefined;
+  let submittedUserTurnIndex: number | undefined;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let attachedExistingTab = false;
   let ownsTarget = true;
@@ -2825,9 +2995,15 @@ async function runRemoteBrowserMode(
           chromeBrowserWSEndpoint: browserWSEndpoint,
           chromeProfileRoot,
           chromeTargetId: remoteTargetId ?? undefined,
-          tabUrl: lastUrl,
-          conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+          tabUrl: submittedConversationUrl ?? lastUrl,
+          conversationId:
+            submittedConversationId ??
+            ((submittedConversationUrl ?? lastUrl)
+              ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+              : undefined),
           promptSubmitted,
+          submittedUserMessageId,
+          submittedUserTurnIndex,
           controllerPid: process.pid,
         },
         modelSelectionEvidence,
@@ -2836,7 +3012,7 @@ async function runRemoteBrowserMode(
         chromeHost: host,
         chromePort: port,
         chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
+        tabUrl: submittedConversationUrl ?? lastUrl,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2849,7 +3025,17 @@ async function runRemoteBrowserMode(
     }
     promptSubmitted = true;
     await emitRuntimeHint();
-    void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    if (config.researchMode === "deep") {
+      const captured = await conversationUrlMonitor?.update("post-submit", 15_000);
+      if (!captured || !submittedConversationId) {
+        throw new BrowserAutomationError(
+          "Deep Research submission did not produce a stable ChatGPT conversation URL.",
+          { stage: "deep-research-scope", code: "deep-research-conversation-unavailable" },
+        );
+      }
+    } else {
+      void conversationUrlMonitor?.schedule("post-submit", config.timeoutMs ?? 120_000);
+    }
   };
   const startedAt = Date.now();
   let answerText = "";
@@ -2938,6 +3124,19 @@ async function runRemoteBrowserMode(
         return typeof result?.value === "string" ? result.value : null;
       },
       persistUrl: async (url) => {
+        const conversationId = extractConversationIdFromUrl(url);
+        if (promptSubmitted && config.researchMode === "deep") {
+          if (!conversationId) return;
+          if (!submittedConversationId) {
+            submittedConversationId = conversationId;
+            submittedConversationUrl = url;
+          } else if (!acceptsSubmittedConversationId(submittedConversationId, conversationId)) {
+            logger(
+              `[browser] Ignoring conversation URL change after Deep Research submission (${submittedConversationId} -> ${conversationId}).`,
+            );
+            return;
+          }
+        }
         lastUrl = url;
         await emitRuntimeHint();
       },
@@ -3127,7 +3326,7 @@ async function runRemoteBrowserMode(
       return {
         baselineTurns,
         baselineAssistantText,
-        deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
+        deepResearchTargetBaseline: deepResearchTargetBaseline?.targetBaseline,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
       };
     };
@@ -3139,7 +3338,7 @@ async function runRemoteBrowserMode(
 
     let baselineTurns: number | null = null;
     let baselineAssistantText: string | null = null;
-    let deepResearchTargetKeys: string[] = [];
+    let deepResearchTargetBaseline: DeepResearchTargetBaseline[] = [];
     let deepResearchTargetBaselineCaptured = false;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
@@ -3155,21 +3354,43 @@ async function runRemoteBrowserMode(
     });
     baselineTurns = submission.baselineTurns;
     baselineAssistantText = submission.baselineAssistantText;
-    deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
+    deepResearchTargetBaseline = submission.deepResearchTargetBaseline ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     const imageArtifactMinTurnIndex = baselineTurns;
     if (deepResearch) {
+      const expectedConversationId = submittedConversationId;
+      if (!expectedConversationId) {
+        throw new BrowserAutomationError(
+          "Deep Research submission did not produce a stable ChatGPT conversation URL.",
+          {
+            stage: "deep-research-scope",
+            code: "deep-research-conversation-unavailable",
+          },
+        );
+      }
+      const pinnedConversationUrl = submittedConversationUrl;
+      const submittedUserTurn = await waitForDeepResearchSubmittedUserTurn(
+        Runtime,
+        expectedConversationId,
+        baselineTurns,
+        submission.submittedPrompt,
+      );
+      submittedUserMessageId = submittedUserTurn.messageId;
+      submittedUserTurnIndex = submittedUserTurn.turnIndex;
+      await emitRuntimeHint();
       await waitForResearchPlanAutoConfirm(Runtime, logger);
       const researchResult = await waitForDeepResearchCompletion(
         Runtime,
         logger,
         config.timeoutMs,
-        baselineTurns,
+        submittedUserTurn.turnIndex,
         Page,
         client,
         {
-          ignoredTargetKeys: deepResearchTargetKeys,
+          targetBaseline: deepResearchTargetBaseline,
           targetBaselineCaptured: deepResearchTargetBaselineCaptured,
+          expectedConversationId,
+          expectedUserMessageId: submittedUserTurn.messageId,
         },
       );
       await activeConversationUrlMonitor.update("post-deep-research", 15_000).catch(() => false);
@@ -3180,7 +3401,7 @@ async function runRemoteBrowserMode(
           saveDeepResearchReportArtifact({
             sessionId: options.sessionId,
             reportMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
+            conversationUrl: pinnedConversationUrl,
             logger,
           }),
         logger,
@@ -3191,7 +3412,7 @@ async function runRemoteBrowserMode(
             sessionId: options.sessionId,
             prompt: promptText,
             answerMarkdown: researchResult.text,
-            conversationUrl: lastUrl,
+            conversationUrl: pinnedConversationUrl,
             artifacts: appendArtifacts(undefined, [reportArtifact]),
             logger,
           }),
@@ -3202,27 +3423,33 @@ async function runRemoteBrowserMode(
         Runtime,
         logger,
         config,
-        conversationUrl: lastUrl,
+        conversationUrl: pinnedConversationUrl,
+        expectedConversationId,
         followUpCount: 0,
         requiredArtifactsSaved: Boolean(reportArtifact && transcriptArtifact),
       });
       runStatus = "complete";
       return {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-        answerHtml: researchResult.html,
+        ...buildDeepResearchAnswerFields(researchResult),
         artifacts: savedArtifacts,
         archive,
         modelSelection: modelSelectionEvidence,
         tookMs: durationMs,
         answerTokens: tokens,
         answerChars: researchResult.text.length,
+        browserTransport: "cdp",
+        chromePid: undefined,
         chromePort: port,
         chromeHost: host,
+        chromeBrowserWSEndpoint: browserWSEndpoint,
+        chromeProfileRoot,
+        userDataDir: undefined,
         chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
-        conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+        tabUrl: pinnedConversationUrl,
+        conversationId: expectedConversationId,
         promptSubmitted,
+        submittedUserMessageId,
+        submittedUserTurnIndex,
         controllerPid: process.pid,
       };
     }
@@ -3314,9 +3541,15 @@ async function runRemoteBrowserMode(
               chromeBrowserWSEndpoint: browserWSEndpoint,
               chromeProfileRoot,
               chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+              tabUrl: submittedConversationUrl ?? lastUrl,
+              conversationId:
+                submittedConversationId ??
+                ((submittedConversationUrl ?? lastUrl)
+                  ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                  : undefined),
               promptSubmitted,
+              submittedUserMessageId,
+              submittedUserTurnIndex,
               controllerPid: process.pid,
             },
           },
@@ -3401,9 +3634,15 @@ async function runRemoteBrowserMode(
               chromeBrowserWSEndpoint: browserWSEndpoint,
               chromeProfileRoot,
               chromeTargetId: remoteTargetId ?? undefined,
-              tabUrl: lastUrl,
-              conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+              tabUrl: submittedConversationUrl ?? lastUrl,
+              conversationId:
+                submittedConversationId ??
+                ((submittedConversationUrl ?? lastUrl)
+                  ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                  : undefined),
               promptSubmitted,
+              submittedUserMessageId,
+              submittedUserTurnIndex,
               controllerPid: process.pid,
             };
             throw await createAssistantTimeoutError({
@@ -3622,9 +3861,15 @@ async function runRemoteBrowserMode(
             chromeBrowserWSEndpoint: browserWSEndpoint,
             chromeProfileRoot,
             chromeTargetId: remoteTargetId ?? undefined,
-            tabUrl: lastUrl,
-            conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+            tabUrl: submittedConversationUrl ?? lastUrl,
+            conversationId:
+              submittedConversationId ??
+              ((submittedConversationUrl ?? lastUrl)
+                ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+                : undefined),
             promptSubmitted,
+            submittedUserMessageId,
+            submittedUserTurnIndex,
             controllerPid: process.pid,
           },
         }),
@@ -3690,9 +3935,15 @@ async function runRemoteBrowserMode(
       chromeProfileRoot,
       userDataDir: undefined,
       chromeTargetId: remoteTargetId ?? undefined,
-      tabUrl: lastUrl,
-      conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+      tabUrl: submittedConversationUrl ?? lastUrl,
+      conversationId:
+        submittedConversationId ??
+        ((submittedConversationUrl ?? lastUrl)
+          ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+          : undefined),
       promptSubmitted,
+      submittedUserMessageId,
+      submittedUserTurnIndex,
       artifacts: savedArtifacts,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
@@ -3724,8 +3975,15 @@ async function runRemoteBrowserMode(
         chromeBrowserWSEndpoint: browserWSEndpoint,
         chromeProfileRoot,
         chromeTargetId: remoteTargetId ?? undefined,
-        tabUrl: lastUrl,
+        tabUrl: submittedConversationUrl ?? lastUrl,
+        conversationId:
+          submittedConversationId ??
+          ((submittedConversationUrl ?? lastUrl)
+            ? extractConversationIdFromUrl((submittedConversationUrl ?? lastUrl) as string)
+            : undefined),
         promptSubmitted,
+        submittedUserMessageId,
+        submittedUserTurnIndex,
         controllerPid: process.pid,
       },
     });
@@ -3767,8 +4025,10 @@ export { resolveBrowserConfig, DEFAULT_BROWSER_CONFIG } from "./config.js";
 
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
+  acceptsSubmittedConversationId,
   assertManualLoginProfileReadyForRun,
   buildAssistantTurnEvidence,
+  buildDeepResearchAnswerFields,
   closeRemoteConnectionAfterRun,
   classifyChatGptUiWarningText,
   collectChatGptUiWarnings,

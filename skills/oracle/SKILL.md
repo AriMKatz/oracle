@@ -29,12 +29,28 @@ Recommended defaults:
 ## GPT-5.6 Pro model selection
 
 `--model gpt-5-pro` is Oracle's selector for ChatGPT's `Pro` picker target. Do
-not add a thinking-time flag. The picker label alone does not identify the
-server-side Pro version, so the final returned assistant turn must also record
+not add a thinking-time flag. For a normal response, the picker label alone
+does not identify the server-side Pro version, so the exact returned DOM
+assistant turn must also record
 `data-message-model-slug="gpt-5-6-pro"` in its saved runtime evidence.
 
-If picker selection or exact returned-turn verification fails, stop. Do not
-switch models or engines. No preliminary model request is required.
+Deep Research has a separate evidence contract. Verified picker evidence
+proves that Pro was selected, and `defaultModelSlug` must be exactly
+`gpt-5-6-pro`. Separately, `assistantTurn.modelSlug` preserves the conversation
+record's exact report-owner/orchestration `model_slug`, and
+`resolvedModelSlug` preserves its exact resolved slug. Those two fields may
+name an Instant model. Do not require them to equal Pro, relabel them as Pro,
+or infer a different model role from them. The saved runtime must also pin the
+exact submitted conversation and the exact authenticated conversation-record
+user message ID plus its pre-submit turn-boundary index that own the report;
+prompt text alone is not identity evidence.
+
+If browser authentication or picker selection fails, stop. For a normal
+response, also stop if exact returned-DOM verification fails. A completed Deep
+Research report whose post-capture provenance or detected-citation evidence is
+incomplete is preserved with a warning, but it must not be claimed as fully
+verified. Do not switch models or engines. No preliminary model request is
+required.
 
 ## Golden path
 
@@ -42,7 +58,7 @@ switch models or engines. No preliminary model request is required.
 2. Preview the bundle with `--dry-run` and `--files-report`.
 3. Run the substantive GPT-5.6 Pro request directly through the copied-profile
    path, or explicitly choose one of the alternate browser paths below.
-4. Verify the saved returned-turn evidence, then read the saved transcript.
+4. Verify the saved response evidence, then read the saved transcript.
 
 ## Standing informed external-upload consent
 
@@ -175,8 +191,20 @@ are essential to the question.
   conversation.
 - Use `--browser-research deep` only when Deep Research is explicitly wanted.
 - Deep Research cannot be combined with browser follow-ups.
-- Browser attachments, bundled files, same-run follow-ups, and Deep Research
-  still require exact evidence for the final returned turn.
+- Browser attachments, bundled files, and same-run follow-ups require exact
+  evidence for the final returned DOM turn. Deep Research instead requires its
+  exact submitted conversation and user record turn, report-owner,
+  terminal-message, selected/default-model, owner-model, resolved-model,
+  capability-version, response-hash, and detected-citation evidence.
+- For a normal response, `assistantTurn.modelSlug` is the exact returned-turn
+  DOM model. For Deep Research, it is instead the exact
+  report-owner/orchestration `model_slug` from the conversation record and may
+  differ from Pro; `defaultModelSlug` is the separate exact selected/default
+  model and `resolvedModelSlug` is the separate exact resolved slug.
+  `finalMessageId` is the terminal assistant message on the active branch and
+  may equal `messageId` when the report owner is itself terminal. Do not
+  collapse those meanings or claim that Pro alone authored the report from
+  picker/default evidence.
 
 ## GPT-5.6 Pro verification and saved output
 
@@ -189,14 +217,60 @@ SESSION_ID="<exact-session-id>"
 jq -e '
   .status == "completed" and
   .browser.modelSelection.requestedModel == "Pro" and
+  .browser.modelSelection.resolvedLabel == "Pro" and
   .browser.modelSelection.strategy == "select" and
+  (.browser.modelSelection.status == "already-selected" or .browser.modelSelection.status == "switched") and
+  .browser.modelSelection.source == "chatgpt-model-picker" and
   .browser.modelSelection.verified == true and
-  .browser.runtime.assistantTurn.modelSlug == "gpt-5-6-pro" and
-  ((.browser.runtime.assistantTurn.messageId // .browser.runtime.assistantTurn.turnId // "") | length > 0) and
   (.browser.runtime.assistantTurn.turnIndex | type == "number") and
-  (.browser.runtime.assistantTurn.responseSha256 | test("^[0-9a-f]{64}$"))
+  (.browser.runtime.assistantTurn.responseSha256 | test("^[0-9a-f]{64}$")) and
+  (
+    if (.options.browserConfig.researchMode // "off") == "deep" then
+      (.browser.runtime.conversationId // "") as $conversationId |
+      ($conversationId | length > 0) and
+      ((.browser.runtime.tabUrl // "") | contains("/c/" + $conversationId)) and
+      ((.browser.runtime.submittedUserMessageId // "") | length > 0) and
+      (.browser.runtime.submittedUserTurnIndex | type == "number") and
+      (.browser.runtime.submittedUserTurnIndex >= 0) and
+      (.browser.runtime.assistantTurn.turnIndex >= .browser.runtime.submittedUserTurnIndex) and
+      .browser.runtime.assistantTurn.metadataSource == "chatgpt-conversation-record" and
+      ((.browser.runtime.assistantTurn.messageId // "") | length > 0) and
+      ((.browser.runtime.assistantTurn.modelSlug // "") | length > 0) and
+      .browser.runtime.assistantTurn.defaultModelSlug == "gpt-5-6-pro" and
+      ((.browser.runtime.assistantTurn.resolvedModelSlug // "") | length > 0) and
+      ((.browser.runtime.assistantTurn.deepResearchVersion // "") | length > 0) and
+      ((.browser.runtime.assistantTurn.finalMessageId // "") | length > 0) and
+      (.browser.citationStatus.total | type == "number") and
+      (.browser.citationStatus.linked | type == "number") and
+      (.browser.citationStatus.missingIndexes == []) and
+      (.browser.citationStatus.linked == .browser.citationStatus.total) and
+      (([.browser.warnings[]?.code] | index("browser-deep-research-provenance-incomplete")) == null) and
+      (([.browser.warnings[]?.code] | index("browser-deep-research-citations-incomplete")) == null)
+    else
+      .browser.runtime.assistantTurn.modelSlug == "gpt-5-6-pro" and
+      ((.browser.runtime.assistantTurn.messageId // .browser.runtime.assistantTurn.turnId // "") | length > 0)
+    end
+  )
 ' "${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$SESSION_ID/meta.json"
 ```
+
+For Deep Research, also verify that the durable report exists and contains no
+internal citation placeholders:
+
+```bash
+REPORT="${ORACLE_HOME_DIR:-$HOME/.oracle}/sessions/$SESSION_ID/artifacts/deep-research-report.md"
+test -s "$REPORT" && ! grep -q 'ORACLE_DEEP_RESEARCH_CITATION_' "$REPORT"
+```
+
+The persisted `citationStatus` plus the absence of
+`browser-deep-research-citations-incomplete` means every detected interactive
+numbered citation was resolved to one unambiguous primary HTTP(S) URL. A clean
+zero-citation status is valid only when ChatGPT exposes affirmative zero-citation
+UI evidence; an empty selector scan by itself is incomplete because it may
+indicate UI-schema drift. For a prompt that explicitly requests citations, also
+require `citationStatus.total > 0`. If either incomplete warning is present, the
+report remains available as a research lead, but do not call the session fully
+verified.
 
 A completed stored `--followup` intentionally skips the picker. Its parent must
 already have passed the new-conversation check, and its new returned turn must

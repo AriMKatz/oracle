@@ -165,6 +165,53 @@ oracle --engine browser \
 
 Oracle activates ChatGPT Deep Research through the composer tools menu, recognizing both the `Deep research` label and current `Get a detailed report` menu variants. It waits for the research plan to auto-confirm, logs high-level progress, then captures the final report from the Deep Research report surface instead of trusting the assistant tool-call wrapper.
 
+Normal browser responses verify `gpt-5-6-pro` from the exact returned DOM
+assistant turn's `data-message-model-slug`. Deep Research uses a different
+evidence path: Oracle binds the report iframe to its exact owning conversation
+turn and reads a compact allowlist of metadata from the authenticated ChatGPT
+conversation record. Verified picker evidence separately proves that Pro was
+selected. The record's selected/default model must be `gpt-5-6-pro`, while its
+exact report-owner/orchestration `model_slug` is stored as
+`assistantTurn.modelSlug` and may be a different value such as an Instant
+model; `resolvedModelSlug` preserves the record's resolved slug separately.
+The Deep Research meaning of `assistantTurn.modelSlug` is therefore not the
+normal-response returned-DOM meaning. Oracle does not relabel the owner slug as
+Pro or assign picker, owner, default, or resolved metadata a model role other
+than the one recorded. `finalMessageId` identifies the terminal assistant
+message on the active branch; it may equal the report-owner message ID when
+that owner is itself terminal, or identify a later terminal assistant message.
+Oracle first freezes the submitted conversation, then persists the exact
+authenticated conversation-record user message ID and the pre-submit DOM
+turn-boundary index. This remains exact even when ChatGPT has not yet hydrated
+the visible user-turn container. The report owner must follow that exact user
+on the active branch; repeated or same-prefix prompt text is never used as a
+substitute for identity, including during reattach. The authenticated browser
+token never leaves the page context.
+
+Deep Research citation numbers are interactive component data rather than
+ordinary anchors. For each detected interactive numbered citation, Oracle
+links the number only when its index maps to one unambiguous primary HTTP(S)
+source URL. If that exact binding is missing or contradictory, the number
+remains readable but unlinked and the session records an incomplete-citation
+warning instead of guessing from nearby or supporting URLs. A legitimate
+citation-free or attachment-based report can have zero detected numbered
+citations only when ChatGPT supplies affirmative zero-citation UI evidence. An
+empty citation selector scan without that evidence is treated as incomplete,
+because it may indicate UI-schema drift. Prompts that explicitly request
+citations require a positive total. Oracle persists the normalized
+`{total, linked, missingIndexes}` citation status with the session so a later
+verifier does not have to infer completeness from the absence of a warning
+alone.
+
+Once a complete report has been captured, missing conversation-record
+provenance or an unresolved detected citation does not discard the report or
+turn the capture into a new model request. Oracle saves the report and records
+the corresponding incomplete-provenance or incomplete-citation warning. Such
+a session must not be described as fully verified until the warning is
+resolved. In contrast, browser authentication or picker-selection failure, and
+failure to verify the exact returned DOM model for a normal response, remain
+fail-closed errors.
+
 If ChatGPT initially exposes only `Called tool` / `Used tool`, Oracle treats that as an incomplete capture for Deep Research rather than a final answer. Reattach the existing session with `oracle session <id> --render` so Oracle can recover the lazy-loaded report from the existing Chrome tab; do not rerun the research unless the browser session is unrecoverable.
 
 Deep Research is browser-only. It does not use connected apps in v1; give it public-web scope, uploaded files, and any domain/source guidance in the prompt. For deep thinking over code or architecture without web search, prefer a normal browser run with a Pro/Thinking model and `--browser-thinking-time heavy`.

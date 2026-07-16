@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 import { resumeBrowserSession, __test__ } from "../../src/browser/reattach.js";
 import type { BrowserLogger, ChromeClient } from "../../src/browser/types.js";
@@ -79,6 +80,79 @@ describe("resumeBrowserSession", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  test("persists required artifacts before applying archive=always on the pinned conversation", async () => {
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/abc",
+      conversationId: "abc",
+    };
+    const order: string[] = [];
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        return { result: { value: runtime.tabUrl } };
+      }
+      if (expression === "1+1") {
+        return { result: { value: 2 } };
+      }
+      if (expression.includes("findArchiveMenuItem")) {
+        order.push("archive");
+        return {
+          result: {
+            value: { status: "archived", conversationUrl: runtime.tabUrl },
+          },
+        };
+      }
+      return { result: { value: null } };
+    });
+    const close = vi.fn(async () => {
+      order.push("close");
+    });
+    const connect = vi.fn(
+      async () =>
+        ({
+          // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+          Runtime: { enable: vi.fn(), evaluate },
+          // biome-ignore lint/style/useNamingConvention: mirrors DevTools protocol domain names
+          DOM: { enable: vi.fn() },
+          close,
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { timeoutMs: 2_000, archiveConversations: "always" },
+      logger,
+      {
+        listTargets,
+        connect,
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "reattached answer",
+          html: "",
+          meta: { messageId: "m1", turnId: "conversation-turn-1" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+        persistResultBeforeClose: vi.fn(async () => {
+          order.push("persist");
+          return true;
+        }),
+      },
+    );
+
+    expect(result.archive).toEqual({
+      mode: "always",
+      attempted: true,
+      archived: true,
+      conversationUrl: runtime.tabUrl,
+    });
+    expect(order).toEqual(["persist", "archive", "close"]);
+  });
+
   test("uses prompt preview turn index when reattaching to an already-open answer", async () => {
     const runtime = {
       chromePort: 51559,
@@ -137,6 +211,8 @@ describe("resumeBrowserSession", () => {
       chromeHost: "127.0.0.1",
       chromeTargetId: "target-1",
       tabUrl: "https://chatgpt.com/c/deep",
+      submittedUserMessageId: "user-message-deep",
+      submittedUserTurnIndex: 3,
     };
     const listTargets = vi.fn(
       async () =>
@@ -172,9 +248,35 @@ describe("resumeBrowserSession", () => {
     const waitForAssistantResponse = vi.fn();
     const captureAssistantMarkdown = vi.fn();
     const waitForDeepResearchCompletion = vi.fn(async () => ({
-      text: "Deep report body",
+      text: "Deep report body [1](<https://example.com/one>) [2]",
       html: "<p>Deep report body</p>",
-      meta: { turnId: null, messageId: null },
+      meta: {
+        turnId: "conversation-turn-4",
+        messageId: "message-deep",
+        finalMessageId: "message-deep-final",
+        turnIndex: 3,
+        modelSlug: "gpt-5-5-instant",
+        resolvedModelSlug: "gpt-5-5-instant",
+        defaultModelSlug: "gpt-5-6-pro",
+        deepResearchVersion: "standard",
+        metadataSource: "chatgpt-conversation-record" as const,
+      },
+      assistantTurn: {
+        turnId: "conversation-turn-4",
+        messageId: "message-deep",
+        finalMessageId: "message-deep-final",
+        turnIndex: 3,
+        modelSlug: "gpt-5-5-instant",
+        resolvedModelSlug: "gpt-5-5-instant",
+        defaultModelSlug: "gpt-5-6-pro",
+        deepResearchVersion: "standard",
+        metadataSource: "chatgpt-conversation-record" as const,
+        responseSha256: createHash("sha256")
+          .update("Deep report body [1](<https://example.com/one>) [2]")
+          .digest("hex"),
+        capturedAt: "2026-07-15T00:00:00.000Z",
+      },
+      citationStatus: { total: 2, linked: 1, missingIndexes: [2] },
     }));
     const logger = vi.fn() as BrowserLogger;
     logger.verbose = true;
@@ -192,20 +294,150 @@ describe("resumeBrowserSession", () => {
       },
     );
 
-    expect(result.answerMarkdown).toBe("Deep report body");
+    expect(result.answerMarkdown).toBe("Deep report body [1](<https://example.com/one>) [2]");
+    expect(result.assistantTurn).toMatchObject({
+      messageId: "message-deep",
+      turnIndex: 3,
+      modelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      responseSha256: createHash("sha256")
+        .update("Deep report body [1](<https://example.com/one>) [2]")
+        .digest("hex"),
+    });
+    expect(result.citationStatus).toEqual({ total: 2, linked: 1, missingIndexes: [2] });
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-citations-incomplete",
+        details: { total: 2, linked: 1, missingIndexes: [2] },
+      }),
+    ]);
     expect(waitForDeepResearchCompletion).toHaveBeenCalledWith(
       expect.objectContaining({ evaluate }),
       logger,
       2000,
-      2,
+      3,
       expect.any(Object),
       expect.any(Object),
       {
         requireScopedTargetOwner: true,
+        expectedConversationId: "deep",
+        expectedUserMessageId: "user-message-deep",
       },
     );
     expect(waitForAssistantResponse).not.toHaveBeenCalled();
     expect(captureAssistantMarkdown).not.toHaveBeenCalled();
+  });
+
+  test("fails closed when a Deep Research reattach leaves the saved conversation", async () => {
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/deep",
+    };
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    let hrefReads = 0;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") {
+        hrefReads += 1;
+        return {
+          result: {
+            value: hrefReads === 1 ? "https://chatgpt.com/c/deep" : "https://chatgpt.com/c/other",
+          },
+        };
+      }
+      if (expression === "1+1") return { result: { value: 2 } };
+      if (expression.includes("querySelectorAll")) return { result: { value: 3 } };
+      return { result: { value: null } };
+    });
+    const close = vi.fn(async () => {});
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(), evaluate },
+      DOM: { enable: vi.fn() },
+      Page: { enable: vi.fn() },
+      close,
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const waitForDeepResearchCompletion = vi.fn();
+    const recoverSession = vi.fn(async () => ({
+      answerText: "safe recovery",
+      answerMarkdown: "safe recovery",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { timeoutMs: 2_000, researchMode: "deep" },
+      logger,
+      {
+        listTargets,
+        connect,
+        waitForDeepResearchCompletion,
+        recoverSession,
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("safe recovery");
+    expect(waitForDeepResearchCompletion).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(recoverSession).toHaveBeenCalledOnce();
+  });
+
+  test("does not scan Deep Research when no reattach turn boundary can be established", async () => {
+    const runtime = {
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      tabUrl: "https://chatgpt.com/c/deep",
+    };
+    const listTargets = vi.fn(
+      async () =>
+        [{ targetId: "target-1", type: "page", url: runtime.tabUrl }] satisfies FakeTarget[],
+    ) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+      if (expression === "1+1") return { result: { value: 2 } };
+      if (expression.includes("const needle =")) return { result: { value: null } };
+      return { result: { value: undefined } };
+    });
+    const close = vi.fn(async () => {});
+    const connect = vi.fn(
+      async () =>
+        ({
+          Runtime: { enable: vi.fn(), evaluate },
+          DOM: { enable: vi.fn() },
+          Page: { enable: vi.fn() },
+          close,
+        }) satisfies FakeClient,
+    ) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const waitForDeepResearchCompletion = vi.fn(async () => ({
+      text: "wrong report",
+      meta: {},
+    }));
+    const recoverSession = vi.fn(async () => ({
+      answerText: "safe fallback",
+      answerMarkdown: "safe fallback",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { timeoutMs: 2_000, researchMode: "deep" },
+      logger,
+      {
+        listTargets,
+        connect,
+        promptPreview: "unmatched prompt preview",
+        waitForDeepResearchCompletion,
+        recoverSession,
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("safe fallback");
+    expect(waitForDeepResearchCompletion).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledOnce();
+    expect(recoverSession).toHaveBeenCalledOnce();
   });
 
   test("falls back to recovery when chrome port is missing", async () => {
@@ -340,6 +572,7 @@ describe("reattach helpers", () => {
     extractConversationIdFromUrl,
     buildConversationUrl,
     openConversationFromSidebar,
+    readReattachMinTurnIndex,
   } = __test__;
   type EvaluateParams = { expression: string };
   type EvaluateResult<T> = { result: { value: T } };
@@ -437,5 +670,21 @@ describe("reattach helpers", () => {
     const call = evaluate.mock.calls[0]?.[0] as EvaluateParams | undefined;
     expect(call?.expression).toContain("const conversationId = null");
     expect(call?.expression).toContain("const preferProjects = false");
+  });
+
+  test("falls back to the current turn index when prompt preview matching misses", async () => {
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression.includes("const needle =")) {
+        return { result: { value: null } };
+      }
+      return { result: { value: 5 } };
+    });
+    const runtime = { evaluate } as unknown as ChromeClient["Runtime"];
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      readReattachMinTurnIndex(runtime, "preview that no longer matches", logger),
+    ).resolves.toBe(4);
+    expect(evaluate).toHaveBeenCalledTimes(2);
   });
 });

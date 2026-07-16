@@ -2,12 +2,15 @@ import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
   BrowserAssistantTurnEvidence,
+  BrowserDeepResearchCitationStatus,
   BrowserModelSelectionEvidence,
   BrowserRunWarning,
   BrowserRuntimeMetadata,
 } from "../sessionStore.js";
 import type { SessionArtifact } from "../sessionStore.js";
 import type { ThinkingTimeLevel } from "../oracle/types.js";
+
+export type { BrowserDeepResearchCitationStatus } from "../sessionStore.js";
 
 export type ChromeClient = Awaited<ReturnType<typeof CDP>>;
 export type CookieParam = Protocol.Network.CookieParam;
@@ -170,6 +173,8 @@ export interface BrowserRunResult {
   modelSelection?: BrowserModelSelectionEvidence;
   /** Evidence from the exact assistant turn represented by the returned answer. */
   assistantTurn?: BrowserAssistantTurnEvidence;
+  /** Exact citation-linking counts for a Deep Research report. */
+  citationStatus?: BrowserDeepResearchCitationStatus;
   warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;
@@ -185,6 +190,8 @@ export interface BrowserRunResult {
   tabUrl?: string;
   conversationId?: string;
   promptSubmitted?: boolean;
+  submittedUserMessageId?: string;
+  submittedUserTurnIndex?: number;
   controllerPid?: number;
 }
 

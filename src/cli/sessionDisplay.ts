@@ -13,6 +13,11 @@ import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import {
+  addDeepResearchPickerEvidenceWarning,
+  replaceDeepResearchEvidenceWarnings,
+  revalidateDeepResearchAnswerFields,
+} from "../browser/deepResearchAnswer.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import {
   appendArtifacts,
@@ -132,7 +137,10 @@ async function saveReattachBrowserArtifacts(
   sessionId: string,
   metadata: SessionMetadata,
   result: { answerText: string; answerMarkdown: string },
-): Promise<SessionMetadata["artifacts"]> {
+): Promise<{
+  artifacts: SessionMetadata["artifacts"];
+  requiredArtifactsSaved: boolean;
+}> {
   const body = result.answerMarkdown || result.answerText;
   const conversationUrl = metadata.browser?.runtime?.tabUrl;
   const logger = ((message: string) => console.log(dim(message))) as BrowserLogger;
@@ -153,7 +161,12 @@ async function saveReattachBrowserArtifacts(
     artifacts: appendArtifacts(undefined, [reportArtifact]),
     logger,
   }).catch(() => null);
-  return appendArtifacts(metadata.artifacts, [reportArtifact, transcriptArtifact]);
+  return {
+    artifacts: appendArtifacts(metadata.artifacts, [reportArtifact, transcriptArtifact]),
+    requiredArtifactsSaved: Boolean(
+      transcriptArtifact && (!isDeepResearchBrowserSession(metadata) || reportArtifact),
+    ),
+  };
 }
 
 export interface ShowStatusOptions {
@@ -309,6 +322,7 @@ export async function attachSession(
       (runtime?.controllerPid && !controllerAlive));
 
   if (canReattach) {
+    const metadataAtReattach = metadata as SessionMetadata;
     const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
     const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
     console.log(
@@ -317,6 +331,7 @@ export async function attachSession(
       ),
     );
     try {
+      let persistedArtifacts: Awaited<ReturnType<typeof saveReattachBrowserArtifacts>> | undefined;
       const result = await resumeBrowserSession(
         runtime as NonNullable<typeof runtime>,
         metadata.browser?.config,
@@ -328,10 +343,28 @@ export async function attachSession(
           }) as unknown as BrowserLogger,
           { verbose: true },
         ),
-        { promptPreview: metadata.promptPreview },
+        {
+          promptPreview: metadata.promptPreview,
+          persistResultBeforeClose: async (captured) => {
+            persistedArtifacts = await saveReattachBrowserArtifacts(
+              sessionId,
+              metadataAtReattach,
+              captured,
+            );
+            return persistedArtifacts.requiredArtifactsSaved;
+          },
+        },
       );
       const outputTokens = estimateTokenCount(result.answerMarkdown);
-      const artifacts = await saveReattachBrowserArtifacts(sessionId, metadata, result);
+      const freshDeepResearchWarnings = isDeepResearchBrowserSession(metadata)
+        ? addDeepResearchPickerEvidenceWarning(
+            revalidateDeepResearchAnswerFields(result).warnings ?? [],
+            metadata.browser?.modelSelection,
+          )
+        : [];
+      const saved =
+        persistedArtifacts ?? (await saveReattachBrowserArtifacts(sessionId, metadata, result));
+      const artifacts = saved.artifacts;
       await writeReattachAnswer(
         sessionId,
         result,
@@ -361,10 +394,20 @@ export async function attachSession(
         },
         errorMessage: undefined,
         browser: {
+          ...metadata.browser,
           config: metadata.browser?.config,
-          runtime,
+          runtime: runtime ? { ...runtime, assistantTurn: result.assistantTurn } : runtime,
+          archive: result.archive ?? metadata.browser?.archive,
           modelSelection: metadata.browser?.modelSelection,
-          warnings: metadata.browser?.warnings,
+          citationStatus: isDeepResearchBrowserSession(metadata)
+            ? result.citationStatus
+            : metadata.browser?.citationStatus,
+          warnings: isDeepResearchBrowserSession(metadata)
+            ? replaceDeepResearchEvidenceWarnings(
+                metadata.browser?.warnings,
+                freshDeepResearchWarnings,
+              )
+            : metadata.browser?.warnings,
         },
         artifacts,
         response: { status: "completed" },

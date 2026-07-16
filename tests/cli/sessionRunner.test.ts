@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import fsPromises from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -1558,6 +1559,79 @@ describe("performSessionRun", () => {
     expect(logLines).toContain("oracle session sess-1 --render");
   });
 
+  test.each([
+    ["deep-research-timeout", "Deep Research timed out"],
+    ["assistant-recheck", "Assistant recheck did not complete"],
+  ])(
+    "marks %s as an incomplete reattachable capture without erasing persisted turn identity",
+    async (stage, expectedLog) => {
+      const exactConversationUrl = "https://chatgpt.com/c/exact-conversation";
+      const automationError = new BrowserAutomationError(`${stage} happened`, {
+        stage,
+        runtime: {
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "latest-target",
+          tabUrl: undefined,
+          conversationId: undefined,
+          submittedUserMessageId: undefined,
+          submittedUserTurnIndex: undefined,
+        },
+      });
+      vi.mocked(runBrowserSessionExecution).mockImplementationOnce(async (_args, deps) => {
+        await deps?.persistRuntimeHint?.({
+          chromePort: 9222,
+          chromeHost: "127.0.0.1",
+          chromeTargetId: "original-target",
+          tabUrl: exactConversationUrl,
+          conversationId: "exact-conversation",
+          promptSubmitted: true,
+          submittedUserMessageId: "exact-user-message",
+          submittedUserTurnIndex: 4,
+        });
+        throw automationError;
+      });
+
+      await performSessionRun({
+        sessionMeta: baseSessionMeta,
+        runOptions: baseRunOptions,
+        mode: "browser",
+        browserConfig: { chromePath: null },
+        cwd: "/tmp",
+        log,
+        write,
+        version: cliVersion,
+      });
+
+      const finalUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
+      expect(finalUpdate).toMatchObject({
+        status: "error",
+        response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+        browser: {
+          runtime: {
+            chromeTargetId: "latest-target",
+            tabUrl: exactConversationUrl,
+            conversationId: "exact-conversation",
+            promptSubmitted: true,
+            submittedUserMessageId: "exact-user-message",
+            submittedUserTurnIndex: 4,
+          },
+        },
+      });
+      expect(sessionStoreMock.updateModelRun).toHaveBeenCalledWith(
+        baseSessionMeta.id,
+        "gpt-5.2-pro",
+        expect.objectContaining({
+          status: "error",
+          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+        }),
+      );
+      const logLines = log.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(logLines).toContain(`${expectedLog}; marking capture incomplete for reattach.`);
+      expect(logLines).toContain("oracle session sess-1 --render");
+    },
+  );
+
   test("records runtime and guidance when cloudflare challenge is detected", async () => {
     const automationError = new BrowserAutomationError(
       "Cloudflare challenge detected. Complete the “Just a moment…” check in the open browser, then rerun.",
@@ -1676,6 +1750,7 @@ describe("performSessionRun", () => {
   });
 
   test("auto-reattaches after assistant timeout when configured", async () => {
+    const recoveredReport = "ok markdown [1](<https://example.com/source>) [2]";
     const automationError = new BrowserAutomationError("assistant timed out", {
       stage: "assistant-timeout",
       runtime: { chromePort: 9222, chromeHost: "127.0.0.1", tabUrl: "https://chatgpt.com/c/demo" },
@@ -1702,7 +1777,28 @@ describe("performSessionRun", () => {
     });
     vi.mocked(resumeBrowserSession).mockResolvedValue({
       answerText: "ok text",
-      answerMarkdown: "ok markdown",
+      answerMarkdown: recoveredReport,
+      assistantTurn: {
+        messageId: "message-reattached",
+        finalMessageId: "message-reattached-final",
+        turnId: "conversation-turn-2",
+        turnIndex: 1,
+        modelSlug: "gpt-5-5-instant",
+        resolvedModelSlug: "gpt-5-5-instant",
+        defaultModelSlug: "gpt-5-6-pro",
+        deepResearchVersion: "standard",
+        metadataSource: "chatgpt-conversation-record",
+        responseSha256: createHash("sha256").update(recoveredReport).digest("hex"),
+        capturedAt: "2026-07-15T00:00:00.000Z",
+      },
+      citationStatus: { total: 2, linked: 1, missingIndexes: [2] },
+      warnings: [],
+      archive: {
+        mode: "always",
+        attempted: true,
+        archived: true,
+        conversationUrl: "https://chatgpt.com/c/demo",
+      },
     });
     vi.mocked(ensureSessionArtifacts).mockResolvedValue([
       { kind: "transcript", path: "/tmp/transcript.md" },
@@ -1710,11 +1806,29 @@ describe("performSessionRun", () => {
     ]);
 
     await performSessionRun({
-      sessionMeta: baseSessionMeta,
+      sessionMeta: {
+        ...baseSessionMeta,
+        browser: {
+          warnings: [
+            {
+              code: "browser-deep-research-provenance-incomplete",
+              severity: "warning",
+              message: "Stale provenance warning.",
+            },
+            {
+              code: "browser-pro-fast-large-run",
+              severity: "warning",
+              message: "Unrelated warning.",
+            },
+          ],
+        },
+      },
       runOptions: baseRunOptions,
       mode: "browser",
       browserConfig: {
         chromePath: null,
+        researchMode: "deep",
+        archiveConversations: "always",
         autoReattachDelayMs: 0,
         autoReattachIntervalMs: 1000,
         autoReattachTimeoutMs: 1000,
@@ -1730,7 +1844,7 @@ describe("performSessionRun", () => {
       expect.objectContaining({
         sessionId: baseSessionMeta.id,
         prompt: baseRunOptions.prompt,
-        answerMarkdown: "ok markdown",
+        answerMarkdown: recoveredReport,
         conversationUrl: "https://chatgpt.com/c/demo",
       }),
     );
@@ -1744,6 +1858,27 @@ describe("performSessionRun", () => {
       response: { status: "completed" },
       browser: expect.objectContaining({
         modelSelection: expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
+        archive: {
+          mode: "always",
+          attempted: true,
+          archived: true,
+          conversationUrl: "https://chatgpt.com/c/demo",
+        },
+        citationStatus: { total: 2, linked: 1, missingIndexes: [2] },
+        warnings: [
+          expect.objectContaining({ code: "browser-pro-fast-large-run" }),
+          expect.objectContaining({
+            code: "browser-deep-research-citations-incomplete",
+            details: { total: 2, linked: 1, missingIndexes: [2] },
+          }),
+        ],
+        runtime: expect.objectContaining({
+          assistantTurn: expect.objectContaining({
+            messageId: "message-reattached",
+            modelSlug: "gpt-5-5-instant",
+            responseSha256: createHash("sha256").update(recoveredReport).digest("hex"),
+          }),
+        }),
       }),
     });
     expect(vi.mocked(sendSessionNotification)).toHaveBeenCalled();

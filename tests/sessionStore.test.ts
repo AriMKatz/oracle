@@ -67,18 +67,25 @@ describe("sessionStore", () => {
     );
     const assistantTurn = {
       messageId: "message-1",
+      finalMessageId: "message-final",
       turnId: "conversation-turn-2",
       turnIndex: 1,
       modelSlug: "gpt-5-6-pro",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record" as const,
       responseSha256: "a".repeat(64),
       capturedAt: "2026-07-14T00:00:00.000Z",
     };
+    const citationStatus = { total: 2, linked: 2, missingIndexes: [] };
     await store.updateSession(meta.id, {
-      browser: { runtime: { assistantTurn } },
+      browser: { runtime: { assistantTurn }, citationStatus },
     });
 
     const fetched = await store.readSession(meta.id);
     expect(fetched?.browser?.runtime?.assistantTurn).toEqual(assistantTurn);
+    expect(fetched?.browser?.citationStatus).toEqual(citationStatus);
   });
 
   test("writes per-model logs and aggregates combined log", async () => {

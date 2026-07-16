@@ -144,6 +144,7 @@ export type {
   BrowserHarvestMetadata,
   BrowserModelSelectionEvidence,
   BrowserModelSelectionEvidenceStatus,
+  BrowserDeepResearchCitationStatus,
   BrowserRunWarning,
   SessionTransportMetadata,
   SessionUserErrorMetadata,

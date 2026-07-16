@@ -116,8 +116,28 @@ describe("archiveChatGptConversation", () => {
       conversationUrl: "https://chatgpt.com/c/abc",
     });
     expect(runtime.evaluate).toHaveBeenCalledWith(
-      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+      expect.objectContaining({
+        expression: expect.stringContaining('const expectedConversationId = "abc"'),
+        awaitPromise: true,
+        returnByValue: true,
+      }),
     );
+  });
+
+  test("fails closed when no exact conversation id can be derived", async () => {
+    const runtime = { evaluate: vi.fn() };
+
+    await expect(
+      archiveChatGptConversation(runtime as never, vi.fn() as never, {
+        mode: "always",
+        conversationUrl: "https://chatgpt.com/",
+      }),
+    ).resolves.toMatchObject({
+      attempted: false,
+      archived: false,
+      reason: "missing-conversation-id",
+    });
+    expect(runtime.evaluate).not.toHaveBeenCalled();
   });
 
   test("returns a non-archived result when the DOM action is not confirmed", async () => {
@@ -148,7 +168,10 @@ describe("archiveChatGptConversation", () => {
   });
 
   test("keeps the archive expression scoped to Archive actions", () => {
-    const expression = buildArchiveConversationExpressionForTest();
+    const expression = buildArchiveConversationExpressionForTest("abc");
+    expect(expression).toContain('const expectedConversationId = "abc"');
+    expect(expression).toContain("if (!isExpectedConversation()) return false");
+    expect(expression).toContain("reason: 'conversation-changed'");
     expect(expression).toContain("findConversationMenuButton");
     expect(expression).toContain("visibleMenuCandidates");
     expect(expression).toContain("findArchiveMenuItem");

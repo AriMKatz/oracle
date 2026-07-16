@@ -1,5 +1,8 @@
+import { createHash, randomBytes } from "node:crypto";
+import type { BrowserAssistantTurnEvidence } from "../../sessionStore.js";
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
+  ASSISTANT_ROLE_SELECTOR,
   DEEP_RESEARCH_PLUS_BUTTON,
   DEEP_RESEARCH_DROPDOWN_ITEM_TEXT,
   DEEP_RESEARCH_PILL_LABEL,
@@ -22,6 +25,141 @@ type ActivateOutcome =
   | { status: "plus-button-missing" }
   | { status: "dropdown-item-missing"; available?: string[] }
   | { status: "pill-not-confirmed"; clickPoint?: { x?: number; y?: number } };
+
+export interface DeepResearchTurnMetadata {
+  messageId?: string | null;
+  finalMessageId?: string | null;
+  turnId?: string | null;
+  turnIndex?: number | null;
+  modelSlug?: string | null;
+  resolvedModelSlug?: string | null;
+  defaultModelSlug?: string | null;
+  deepResearchVersion?: string | null;
+  metadataSource?: "chatgpt-conversation-record";
+}
+
+export interface DeepResearchCitationStatus {
+  total: number;
+  linked: number;
+  missingIndexes: number[];
+}
+
+export interface DeepResearchTargetBaseline {
+  targetId: string;
+  /** null means the target was confirmed but its report state was unreadable. */
+  completed: boolean | null;
+  contentSha256?: string;
+}
+
+export interface DeepResearchCompletionResult {
+  text: string;
+  html?: string;
+  meta: DeepResearchTurnMetadata;
+  assistantTurn?: BrowserAssistantTurnEvidence;
+  citationStatus?: DeepResearchCitationStatus;
+}
+
+export interface DeepResearchSubmittedUserTurn {
+  messageId: string;
+  turnIndex: number;
+}
+
+function normalizeDeepResearchTurnMetadata(value: unknown): DeepResearchTurnMetadata | null {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return { turnIndex: Math.floor(value) };
+  }
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value as DeepResearchTurnMetadata;
+  const normalizeString = (input: unknown): string | null =>
+    typeof input === "string" ? input.trim() || null : null;
+  const messageId = normalizeString(raw.messageId);
+  const finalMessageId = normalizeString(raw.finalMessageId);
+  const turnId = normalizeString(raw.turnId);
+  const turnIndex =
+    typeof raw.turnIndex === "number" && Number.isFinite(raw.turnIndex) && raw.turnIndex >= 0
+      ? Math.floor(raw.turnIndex)
+      : null;
+  const modelSlug = normalizeString(raw.modelSlug);
+  const resolvedModelSlug = normalizeString(raw.resolvedModelSlug);
+  const defaultModelSlug = normalizeString(raw.defaultModelSlug);
+  const deepResearchVersion = normalizeString(raw.deepResearchVersion);
+  const metadataSource =
+    raw.metadataSource === "chatgpt-conversation-record" ? raw.metadataSource : undefined;
+  if (
+    !messageId &&
+    !finalMessageId &&
+    !turnId &&
+    turnIndex === null &&
+    !modelSlug &&
+    !resolvedModelSlug &&
+    !defaultModelSlug &&
+    !deepResearchVersion &&
+    !metadataSource
+  ) {
+    return null;
+  }
+  return {
+    messageId,
+    turnId,
+    turnIndex,
+    modelSlug,
+    ...(finalMessageId ? { finalMessageId } : {}),
+    ...(resolvedModelSlug ? { resolvedModelSlug } : {}),
+    ...(defaultModelSlug ? { defaultModelSlug } : {}),
+    ...(deepResearchVersion ? { deepResearchVersion } : {}),
+    ...(metadataSource ? { metadataSource } : {}),
+  };
+}
+
+function buildDeepResearchAssistantTurnEvidence(
+  meta: DeepResearchTurnMetadata | null | undefined,
+  reportMarkdown: string,
+): BrowserAssistantTurnEvidence | undefined {
+  const normalized = normalizeDeepResearchTurnMetadata(meta);
+  const messageId = normalized?.messageId?.trim() || undefined;
+  const turnId = normalized?.turnId?.trim() || undefined;
+  const turnIndex = typeof normalized?.turnIndex === "number" ? normalized.turnIndex : undefined;
+  const modelSlug = normalized?.modelSlug?.trim() || undefined;
+
+  // A hash alone is not provenance. Require both a concrete conversation-turn
+  // position and an identity attribute from the exact iframe owner before
+  // emitting evidence. The model slug stays optional so callers can fail closed
+  // without discarding an otherwise useful, correctly bound report.
+  if (turnIndex === undefined || (!messageId && !turnId)) {
+    return undefined;
+  }
+  return {
+    messageId,
+    finalMessageId: normalized?.finalMessageId?.trim() || undefined,
+    turnId,
+    turnIndex,
+    modelSlug,
+    resolvedModelSlug: normalized?.resolvedModelSlug?.trim() || undefined,
+    defaultModelSlug: normalized?.defaultModelSlug?.trim() || undefined,
+    deepResearchVersion: normalized?.deepResearchVersion?.trim() || undefined,
+    metadataSource: normalized?.metadataSource,
+    responseSha256: createHash("sha256").update(reportMarkdown.trim()).digest("hex"),
+    capturedAt: new Date().toISOString(),
+  };
+}
+
+function finalizeDeepResearchResult(
+  text: string,
+  html: string | undefined,
+  meta: DeepResearchTurnMetadata | null | undefined,
+  citationStatus?: DeepResearchCitationStatus,
+): DeepResearchCompletionResult {
+  const normalizedMeta = normalizeDeepResearchTurnMetadata(meta) ?? {};
+  return {
+    text,
+    html,
+    meta: normalizedMeta,
+    assistantTurn: buildDeepResearchAssistantTurnEvidence(normalizedMeta, text),
+    citationStatus,
+  };
+}
 
 /**
  * Activates Deep Research mode through ChatGPT's composer tools menu and
@@ -198,6 +336,315 @@ export async function waitForResearchPlanAutoConfirm(
   logger("Auto-confirm wait complete, proceeding to monitor research progress");
 }
 
+function buildDeepResearchSubmittedUserTurnExpression(
+  expectedConversationId: string,
+  minTurnIndex: number,
+  expectedPrompt: string,
+  promptIsPreview: boolean,
+): string {
+  return `(async () => {
+    const expectedConversationId = ${JSON.stringify(expectedConversationId)};
+    const minTurnIndex = ${JSON.stringify(Math.floor(minTurnIndex))};
+    const expectedPrompt = ${JSON.stringify(expectedPrompt)};
+    const promptIsPreview = ${JSON.stringify(promptIsPreview)};
+    const asString = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+    const normalizePromptComparable = (value) =>
+      String(value || '')
+        .replace(/\\r\\n?/g, '\\n')
+        .trim()
+        .replace(/^@?deep research\\b[ \\t\\n]*/i, '')
+        .trim();
+    const protocol = String(location.protocol || '').toLowerCase();
+    const hostname = String(location.hostname || '').toLowerCase();
+    const port = String(location.port || '');
+    const allowedHostname = hostname === 'chatgpt.com' || hostname === 'chat.openai.com';
+    if (protocol !== 'https:' || !allowedHostname || (port && port !== '443')) {
+      return { conversationId: null, unavailable: true, reason: 'origin-unavailable' };
+    }
+    const conversationId = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null;
+    if (conversationId !== expectedConversationId) {
+      return { conversationId, changed: true };
+    }
+    const expected = normalizePromptComparable(expectedPrompt);
+    if (!expected) return { conversationId, unavailable: true, reason: 'prompt-unavailable' };
+    const promptMatchesExpected = (value) => {
+      const normalized = normalizePromptComparable(value);
+      return promptIsPreview ? normalized.startsWith(expected) : normalized === expected;
+    };
+    const turns = ${buildConversationTurnListExpression()};
+    const domUserTurns = [];
+    for (let index = minTurnIndex; index < turns.length; index += 1) {
+      const turn = turns[index];
+      const role = turn?.getAttribute?.('data-message-author-role') ||
+        turn?.getAttribute?.('data-turn') ||
+        (turn?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]')
+          ? 'user'
+          : null);
+      if (role !== 'user') continue;
+      const text = normalizePromptComparable(turn?.innerText || turn?.textContent || '');
+      const ids = Array.from(new Set([
+        turn?.getAttribute?.('data-message-id'),
+        ...Array.from(turn?.querySelectorAll?.('[data-message-id]') || [])
+          .map((node) => node?.getAttribute?.('data-message-id')),
+      ].filter((value) =>
+        typeof value === 'string' &&
+        value.trim() &&
+        !/^request-web:/i.test(value) &&
+        !/^conversation-turn-\\d+$/i.test(value)
+      ).map((value) => value.trim())));
+      domUserTurns.push({ ids, text, turnIndex: index });
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let record;
+    try {
+      const authResponse = await fetch('/api/auth/session', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+        signal: controller.signal,
+      });
+      if (!authResponse.ok) {
+        return {
+          conversationId,
+          unavailable: true,
+          reason: 'auth-response-unavailable',
+          status: authResponse.status,
+        };
+      }
+      const auth = await authResponse.json();
+      const accessToken = asString(auth?.accessToken);
+      if (!accessToken) {
+        return { conversationId, unavailable: true, reason: 'auth-token-unavailable' };
+      }
+      const recordResponse = await fetch(
+        '/backend-api/conversation/' + encodeURIComponent(conversationId),
+        {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'error',
+          signal: controller.signal,
+          headers: { authorization: 'Bearer ' + accessToken },
+        },
+      );
+      if (!recordResponse.ok) {
+        return {
+          conversationId,
+          unavailable: true,
+          reason: 'conversation-record-unavailable',
+          status: recordResponse.status,
+        };
+      }
+      record = await recordResponse.json();
+    } catch {
+      return { conversationId, unavailable: true, reason: 'conversation-record-fetch-failed' };
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      (String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null) !==
+      expectedConversationId
+    ) return { conversationId: null, changed: true };
+
+    const mapping = record?.mapping;
+    if (!mapping || typeof mapping !== 'object') {
+      return { conversationId, unavailable: true, reason: 'conversation-mapping-unavailable' };
+    }
+    const currentBranch = [];
+    const seen = new Set();
+    let cursor = record?.current_node;
+    while (typeof cursor === 'string' && cursor && currentBranch.length < 10000) {
+      if (seen.has(cursor)) {
+        return { conversationId, unavailable: true, reason: 'conversation-branch-cycle' };
+      }
+      seen.add(cursor);
+      const node = mapping[cursor];
+      if (!node) {
+        return { conversationId, unavailable: true, reason: 'conversation-node-unavailable' };
+      }
+      currentBranch.push(node);
+      if (node.parent == null) {
+        cursor = null;
+        break;
+      }
+      if (typeof node.parent !== 'string' || !node.parent) {
+        return { conversationId, unavailable: true, reason: 'conversation-parent-unavailable' };
+      }
+      cursor = node.parent;
+    }
+    if (cursor) {
+      return { conversationId, unavailable: true, reason: 'conversation-branch-too-deep' };
+    }
+    currentBranch.reverse();
+    const messageText = (message) => {
+      const content = message?.content;
+      if (typeof content?.text === 'string') return content.text;
+      if (Array.isArray(content?.parts)) {
+        return content.parts.filter((part) => typeof part === 'string').join('\\n');
+      }
+      return '';
+    };
+    const branchUsers = currentBranch.filter(
+      (node) => node?.message?.author?.role === 'user',
+    );
+    const lastBranchUser = branchUsers[branchUsers.length - 1] || null;
+    const branchPromptMatched = Boolean(
+      lastBranchUser && promptMatchesExpected(messageText(lastBranchUser?.message)),
+    );
+    if (!lastBranchUser || !branchPromptMatched) {
+      return {
+        conversationId,
+        unavailable: true,
+        reason: 'conversation-user-unmatched',
+        branchUserCount: branchUsers.length,
+        branchPromptMatched,
+      };
+    }
+
+    const messageId = asString(lastBranchUser?.message?.id);
+    if (!messageId) {
+      return { conversationId, unavailable: true, reason: 'conversation-user-id-unavailable' };
+    }
+    const exactDomMatches = domUserTurns.filter((candidate) =>
+      candidate.ids.includes(messageId)
+    );
+    const promptDomMatches = domUserTurns.filter((candidate) =>
+      candidate.text.includes(expected)
+    );
+    const matchedDomTurn =
+      exactDomMatches.length === 1
+        ? exactDomMatches[0]
+        : promptDomMatches.length === 1
+          ? promptDomMatches[0]
+          : domUserTurns.length === 1
+            ? domUserTurns[0]
+            : domUserTurns.length === 0
+              ? { turnIndex: minTurnIndex }
+              : null;
+    if (!matchedDomTurn) {
+      return {
+        conversationId,
+        unavailable: true,
+        reason: 'dom-user-turn-ambiguous',
+        domUserCount: domUserTurns.length,
+        exactDomMatchCount: exactDomMatches.length,
+        promptDomMatchCount: promptDomMatches.length,
+      };
+    }
+    return { conversationId, messageId, turnIndex: matchedDomTurn.turnIndex };
+  })()`;
+}
+
+export async function waitForDeepResearchSubmittedUserTurn(
+  Runtime: ChromeClient["Runtime"],
+  expectedConversationId: string,
+  minTurnIndex: number | null | undefined,
+  expectedPrompt: string | null | undefined,
+  timeoutMs = 60_000,
+  options: { promptIsPreview?: boolean } = {},
+): Promise<DeepResearchSubmittedUserTurn> {
+  const prompt = expectedPrompt?.trim();
+  if (
+    !expectedConversationId.trim() ||
+    typeof minTurnIndex !== "number" ||
+    !Number.isFinite(minTurnIndex) ||
+    minTurnIndex < 0 ||
+    !prompt
+  ) {
+    throw new BrowserAutomationError(
+      "Deep Research submitted user turn could not be identified exactly.",
+      { stage: "deep-research-scope", code: "deep-research-user-turn-unavailable" },
+    );
+  }
+  const deadline = Date.now() + timeoutMs;
+  let lastDiagnostic: Record<string, unknown> | undefined;
+  do {
+    const { result } = await Runtime.evaluate({
+      expression: buildDeepResearchSubmittedUserTurnExpression(
+        expectedConversationId,
+        minTurnIndex,
+        prompt,
+        options.promptIsPreview === true,
+      ),
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const value = result?.value as
+      | {
+          conversationId?: string | null;
+          changed?: boolean;
+          messageId?: string;
+          turnIndex?: number;
+          unavailable?: boolean;
+          reason?: string;
+          status?: number;
+          branchUserCount?: number;
+          branchPromptMatched?: boolean;
+          domUserCount?: number;
+          exactDomMatchCount?: number;
+          promptDomMatchCount?: number;
+        }
+      | undefined;
+    if (value?.changed || value?.conversationId !== expectedConversationId) {
+      throw new BrowserAutomationError(
+        "ChatGPT left the submitted Deep Research conversation before its exact user turn could be bound.",
+        { stage: "deep-research-scope", code: "deep-research-conversation-changed" },
+      );
+    }
+    if (
+      typeof value.messageId === "string" &&
+      value.messageId.trim() &&
+      typeof value.turnIndex === "number" &&
+      value.turnIndex >= minTurnIndex
+    ) {
+      return { messageId: value.messageId.trim(), turnIndex: Math.floor(value.turnIndex) };
+    }
+    if (value?.unavailable) {
+      lastDiagnostic = {
+        reason: value.reason ?? "unknown",
+        ...(typeof value.status === "number" ? { status: value.status } : {}),
+        ...(typeof value.branchUserCount === "number"
+          ? { branchUserCount: value.branchUserCount }
+          : {}),
+        ...(typeof value.branchPromptMatched === "boolean"
+          ? { branchPromptMatched: value.branchPromptMatched }
+          : {}),
+        ...(typeof value.domUserCount === "number" ? { domUserCount: value.domUserCount } : {}),
+        ...(typeof value.exactDomMatchCount === "number"
+          ? { exactDomMatchCount: value.exactDomMatchCount }
+          : {}),
+        ...(typeof value.promptDomMatchCount === "number"
+          ? { promptDomMatchCount: value.promptDomMatchCount }
+          : {}),
+      };
+    }
+    await delay(100);
+  } while (Date.now() < deadline);
+
+  throw new BrowserAutomationError(
+    "Deep Research submitted user turn did not expose one exact record message ID.",
+    {
+      stage: "deep-research-scope",
+      code: "deep-research-user-turn-unavailable",
+      ...(lastDiagnostic ? { diagnostic: lastDiagnostic } : {}),
+    },
+  );
+}
+
+export function buildDeepResearchSubmittedUserTurnExpressionForTest(
+  expectedConversationId: string,
+  minTurnIndex: number,
+  expectedPrompt: string,
+  promptIsPreview = false,
+): string {
+  return buildDeepResearchSubmittedUserTurnExpression(
+    expectedConversationId,
+    minTurnIndex,
+    expectedPrompt,
+    promptIsPreview,
+  );
+}
+
 /**
  * Polls for Deep Research completion over 5-30+ minutes.
  * Returns the full response text, optional HTML, and turn metadata.
@@ -211,14 +658,13 @@ export async function waitForDeepResearchCompletion(
   client?: ChromeClient,
   options?: {
     ignoredTargetKeys?: readonly string[];
+    targetBaseline?: readonly DeepResearchTargetBaseline[];
     requireScopedTargetOwner?: boolean;
     targetBaselineCaptured?: boolean;
+    expectedConversationId?: string;
+    expectedUserMessageId?: string;
   },
-): Promise<{
-  text: string;
-  html?: string;
-  meta: { turnId?: string | null; messageId?: string | null };
-}> {
+): Promise<DeepResearchCompletionResult> {
   const start = Date.now();
   let lastLogTime = start;
   let lastTextLength = 0;
@@ -227,10 +673,47 @@ export async function waitForDeepResearchCompletion(
       ? Math.floor(minTurnIndex)
       : -1;
   const scopedToNewTurns = minTurnLiteral >= 0;
-  const ignoredTargetKeys = new Set(options?.ignoredTargetKeys ?? []);
-  const requireScopedTargetOwner =
-    options?.requireScopedTargetOwner === true ||
-    (scopedToNewTurns && options?.targetBaselineCaptured !== true);
+  const targetBaselineById = new Map(
+    (options?.targetBaseline ?? []).map((entry) => [entry.targetId, entry] as const),
+  );
+  const ignoredTargetKeys = new Set([
+    ...(options?.ignoredTargetKeys ?? []),
+    ...targetBaselineById.keys(),
+  ]);
+  const requireScopedTargetOwner = options?.requireScopedTargetOwner === true || scopedToNewTurns;
+  if (options?.targetBaselineCaptured === false) {
+    throw new BrowserAutomationError(
+      "Deep Research target baseline capture failed before submission; refusing to verify a report whose target freshness cannot be established.",
+      {
+        stage: "deep-research-scope",
+        code: "deep-research-target-baseline-unavailable",
+      },
+    );
+  }
+  if (options?.targetBaselineCaptured === true && !scopedToNewTurns) {
+    throw new BrowserAutomationError(
+      "Deep Research conversation turn boundary was unavailable after submission; refusing an unscoped completed report.",
+      { stage: "deep-research-scope", code: "deep-research-scope-unavailable" },
+    );
+  }
+  if (options?.requireScopedTargetOwner === true && !scopedToNewTurns) {
+    throw new BrowserAutomationError(
+      "Deep Research owner scoping was required, but no valid conversation turn index was available.",
+      { stage: "deep-research-scope", code: "deep-research-scope-unavailable" },
+    );
+  }
+  if (requireScopedTargetOwner && !options?.expectedConversationId?.trim()) {
+    throw new BrowserAutomationError(
+      "Deep Research conversation ID was unavailable after submission; refusing an unpinned completed report.",
+      { stage: "deep-research-scope", code: "deep-research-conversation-unavailable" },
+    );
+  }
+  if (requireScopedTargetOwner && !options?.expectedUserMessageId?.trim()) {
+    throw new BrowserAutomationError(
+      "Deep Research submitted user message ID was unavailable; refusing a report that is not bound to the exact requested turn.",
+      { stage: "deep-research-scope", code: "deep-research-user-turn-unavailable" },
+    );
+  }
   let observedResearchEvidence = false;
   let loggedIncompleteResult = false;
 
@@ -252,8 +735,16 @@ export async function waitForDeepResearchCompletion(
           incompleteResult?: boolean;
           researchActivity?: boolean;
           accountBlocked?: boolean;
+          conversationId?: string | null;
         }
       | undefined;
+
+    if (options?.expectedConversationId && val?.conversationId !== options.expectedConversationId) {
+      throw new BrowserAutomationError(
+        "ChatGPT navigated away from the submitted Deep Research conversation; refusing to read another conversation's report.",
+        { stage: "deep-research-scope", code: "deep-research-conversation-changed" },
+      );
+    }
 
     if (val?.accountBlocked) {
       throw new BrowserAutomationError(
@@ -274,21 +765,27 @@ export async function waitForDeepResearchCompletion(
           await readDeepResearchTargetResult(
             client,
             ignoredTargetKeys,
-            requireScopedTargetOwner ? minTurnLiteral : -1,
+            scopedToNewTurns ? minTurnLiteral : -1,
+            requireScopedTargetOwner,
+            true,
+            targetBaselineById,
+            options?.expectedConversationId,
+            options?.expectedUserMessageId,
           ).catch(() => null)
         )?.read ?? null)
       : null;
     const targetResult = filterIncompleteDeepResearchRead(rawTargetResult);
-    // A completed target read is authoritative. If the target read is missing or
-    // only in-progress, still try the in-page frame path so an incomplete target
-    // read does not suppress a completed report there (legacy/inline rendering).
+    // A scoped run must complete through the exact target-owner path. The
+    // legacy inline-frame fallback has no pre-submit content baseline, so it is
+    // retained only for explicitly unscoped compatibility reads.
     const inPageScan =
-      !targetResult?.completed && Page
+      !targetResult?.completed && Page && !requireScopedTargetOwner
         ? await readDeepResearchFrameResult(
             Runtime,
             Page,
             client,
             scopedToNewTurns ? minTurnLiteral : -1,
+            scopedToNewTurns,
           ).catch(() => null)
         : null;
     const rawInPageResult = inPageScan?.read ?? null;
@@ -305,15 +802,11 @@ export async function waitForDeepResearchCompletion(
     );
     if (read?.completed && read.text) {
       logger(`Deep Research completed (${Math.round((Date.now() - start) / 1000)}s elapsed)`);
-      return {
-        text: read.text,
-        html: read.html,
-        meta: { turnId: null, messageId: null },
-      };
+      return finalizeDeepResearchResult(read.text, read.html, read.meta, read.citationStatus);
     }
 
     // Completion detected
-    if (val?.finished) {
+    if (val?.finished && !requireScopedTargetOwner) {
       if (!observedResearchEvidence) {
         throw new BrowserAutomationError(
           "ChatGPT returned a completed response without starting Deep Research. The Deep Research selection may have silently fallen back to a normal response.",
@@ -374,26 +867,24 @@ export async function extractDeepResearchResult(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
   minTurnIndex?: number,
-): Promise<{
-  text: string;
-  html?: string;
-  meta: { turnId?: string | null; messageId?: string | null };
-}> {
+): Promise<DeepResearchCompletionResult> {
   const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex);
   const meta = {
     turnId: snapshot?.turnId ?? null,
     messageId: snapshot?.messageId ?? null,
+    turnIndex: snapshot?.turnIndex ?? null,
+    modelSlug: snapshot?.modelSlug ?? null,
   };
 
   // Try the copy-button approach first for clean markdown
   const markdown = await captureAssistantMarkdown(Runtime, meta, logger);
   if (markdown && !isDeepResearchIncompleteText(markdown)) {
-    return { text: markdown, html: snapshot?.html ?? undefined, meta };
+    return finalizeDeepResearchResult(markdown, snapshot?.html ?? undefined, meta);
   }
 
   // Fall back to snapshot text
   if (snapshot?.text && !isDeepResearchIncompleteText(snapshot.text)) {
-    return { text: snapshot.text, html: snapshot.html ?? undefined, meta };
+    return finalizeDeepResearchResult(snapshot.text, snapshot.html ?? undefined, meta);
   }
 
   throw new BrowserAutomationError(
@@ -417,11 +908,46 @@ interface DeepResearchFrameStatus {
   textLength: number;
   text?: string;
   html?: string;
+  meta?: DeepResearchTurnMetadata;
+  citationStatus?: DeepResearchCitationStatus;
+  citationMarkerNonce?: string;
+  citationRootComparable?: string;
+  citationReportNeedle?: string;
+  declaredCitationCount?: number;
+  contentSha256?: string;
+}
+
+export interface DeepResearchCitationSource {
+  index: number;
+  url: string;
+  label?: string;
+}
+
+interface DeepResearchCitationSourceScan {
+  observedIndexes: number[];
+  sources: DeepResearchCitationSource[];
+}
+
+function hasVerifiedDeepResearchCitationUiContract(
+  scan: DeepResearchCitationSourceScan | null,
+  declaredCitationCount: number | undefined,
+): boolean {
+  return (
+    scan !== null && (scan.observedIndexes.length > 0 || typeof declaredCitationCount === "number")
+  );
+}
+
+export function hasVerifiedDeepResearchCitationUiContractForTest(
+  scan: DeepResearchCitationSourceScan | null,
+  declaredCitationCount: number | undefined,
+): boolean {
+  return hasVerifiedDeepResearchCitationUiContract(scan, declaredCitationCount);
 }
 
 interface DeepResearchTargetScanResult {
   read: DeepResearchFrameStatus | null;
   targetKeys: string[];
+  targetBaseline: DeepResearchTargetBaseline[];
 }
 
 interface DeepResearchTargetSessionResult {
@@ -432,7 +958,158 @@ interface DeepResearchTargetSessionResult {
 
 interface DeepResearchFrameReadResult {
   read: DeepResearchFrameStatus;
-  ownerTurnIndex: number | null;
+  ownerMeta: DeepResearchTurnMetadata | null;
+}
+
+function isEligibleScopedDeepResearchOwner(
+  meta: DeepResearchTurnMetadata | null | undefined,
+  minTurnIndex: number,
+): boolean {
+  const messageId = meta?.messageId?.trim();
+  return Boolean(
+    typeof meta?.turnIndex === "number" &&
+    meta.turnIndex >= minTurnIndex &&
+    messageId &&
+    !/^request-web:/i.test(messageId),
+  );
+}
+
+function isAuthoritativeDeepResearchOwner(
+  meta: DeepResearchTurnMetadata | null | undefined,
+  minTurnIndex: number,
+): boolean {
+  return (
+    isEligibleScopedDeepResearchOwner(meta, minTurnIndex) &&
+    meta?.metadataSource === "chatgpt-conversation-record"
+  );
+}
+
+function isEligibleScopedDeepResearchOwnerPosition(
+  meta: DeepResearchTurnMetadata | null | undefined,
+  minTurnIndex: number,
+): boolean {
+  const messageId = meta?.messageId?.trim();
+  return Boolean(
+    typeof meta?.turnIndex === "number" &&
+    meta.turnIndex >= minTurnIndex &&
+    (!messageId || !/^request-web:/i.test(messageId)),
+  );
+}
+
+function isSameDeepResearchOwner(
+  before: DeepResearchTurnMetadata | null | undefined,
+  after: DeepResearchTurnMetadata | null | undefined,
+): boolean {
+  const first = normalizeDeepResearchTurnMetadata(before);
+  const second = normalizeDeepResearchTurnMetadata(after);
+  const stablePosition = Boolean(
+    typeof first?.turnIndex === "number" &&
+    second?.turnIndex === first.turnIndex &&
+    first.turnId &&
+    second.turnId === first.turnId,
+  );
+  const stableExactMessage = Boolean(
+    first?.messageId &&
+    second?.messageId === first.messageId &&
+    typeof first.turnIndex === "number" &&
+    second.turnIndex === first.turnIndex,
+  );
+  const hasEitherExactMessage = Boolean(first?.messageId || second?.messageId);
+  return Boolean(
+    (hasEitherExactMessage ? stableExactMessage : stablePosition) &&
+    (!first?.turnId || !second?.turnId || second.turnId === first.turnId),
+  );
+}
+
+export function isSameDeepResearchOwnerForTest(
+  before: DeepResearchTurnMetadata | null | undefined,
+  after: DeepResearchTurnMetadata | null | undefined,
+): boolean {
+  return isSameDeepResearchOwner(before, after);
+}
+
+function fingerprintDeepResearchContent(text: string): string {
+  // The serializer uses a random nonce to distinguish its markers from report
+  // text. Canonicalize only that nonce before hashing the pre-link Markdown.
+  const canonical = text
+    .trim()
+    .replace(/\[\[ORACLE_DEEP_RESEARCH_CITATION(?:_[a-f0-9]{32})?_(\d{1,3})\]\]/gi, "[$1]");
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+function hasStableCompletedDeepResearchRead(
+  first: DeepResearchFrameStatus | null | undefined,
+  second: DeepResearchFrameStatus | null | undefined,
+): boolean {
+  if (
+    first?.completed !== true ||
+    second?.completed !== true ||
+    !first.text ||
+    !second.text ||
+    !first.contentSha256 ||
+    !second.contentSha256
+  ) {
+    return false;
+  }
+  const citationStatusKey = (status: DeepResearchCitationStatus | undefined): string | null =>
+    status
+      ? JSON.stringify({
+          total: status.total,
+          linked: status.linked,
+          missingIndexes: [...status.missingIndexes].sort((a, b) => a - b),
+        })
+      : null;
+  return (
+    first.contentSha256 === second.contentSha256 &&
+    first.text === second.text &&
+    citationStatusKey(first.citationStatus) === citationStatusKey(second.citationStatus)
+  );
+}
+
+export function hasStableCompletedDeepResearchReadForTest(
+  first: DeepResearchFrameStatus | null | undefined,
+  second: DeepResearchFrameStatus | null | undefined,
+): boolean {
+  return hasStableCompletedDeepResearchRead(first, second);
+}
+
+function hasFreshDeepResearchContentProof(
+  baseline: DeepResearchTargetBaseline,
+  currentContentSha256: string | undefined,
+): boolean {
+  if (baseline.completed === false) return true;
+  if (baseline.completed !== true) return false;
+  return Boolean(
+    baseline.contentSha256 &&
+    currentContentSha256 &&
+    baseline.contentSha256 !== currentContentSha256,
+  );
+}
+
+export function hasFreshDeepResearchContentProofForTest(
+  baseline: DeepResearchTargetBaseline,
+  currentContentSha256: string | undefined,
+): boolean {
+  return hasFreshDeepResearchContentProof(baseline, currentContentSha256);
+}
+
+function preferEarlierScopedRead(
+  current: DeepResearchFrameStatus | null,
+  candidate: DeepResearchFrameStatus,
+  minTurnIndex: number,
+): DeepResearchFrameStatus {
+  if (!current || minTurnIndex < 0) {
+    return candidate;
+  }
+  const currentIndex = current.meta?.turnIndex;
+  const candidateIndex = candidate.meta?.turnIndex;
+  if (typeof candidateIndex !== "number") {
+    return current;
+  }
+  if (typeof currentIndex !== "number" || candidateIndex < currentIndex) {
+    return candidate;
+  }
+  return current;
 }
 
 function filterIncompleteDeepResearchRead(
@@ -442,6 +1119,33 @@ function filterIncompleteDeepResearchRead(
     return result;
   }
   return { ...result, completed: false, inProgress: true };
+}
+
+function shouldSkipDeepResearchTarget(
+  targetId: string | undefined,
+  ignoredTargetKeys: ReadonlySet<string>,
+  hasCapturedTargetBaseline: boolean,
+  minTurnIndex: number,
+  requireScopedTargetOwner: boolean,
+): boolean {
+  if (!targetId || !ignoredTargetKeys.has(targetId)) return false;
+  return !(hasCapturedTargetBaseline && requireScopedTargetOwner && minTurnIndex >= 0);
+}
+
+export function shouldSkipDeepResearchTargetForTest(
+  targetId: string | undefined,
+  ignoredTargetKeys: readonly string[],
+  hasCapturedTargetBaseline: boolean,
+  minTurnIndex: number,
+  requireScopedTargetOwner: boolean,
+): boolean {
+  return shouldSkipDeepResearchTarget(
+    targetId,
+    new Set(ignoredTargetKeys),
+    hasCapturedTargetBaseline,
+    minTurnIndex,
+    requireScopedTargetOwner,
+  );
 }
 
 export function filterIncompleteDeepResearchReadForTest(
@@ -483,6 +1187,7 @@ async function readDeepResearchFrameResult(
   Page: ChromeClient["Page"],
   client?: ChromeClient,
   minTurnIndex = -1,
+  requireScopedTargetOwner = false,
 ): Promise<DeepResearchFrameReadResult | null> {
   const pageWithFrames = Page as ChromeClient["Page"] & {
     getFrameTree?: () => Promise<{ frameTree?: DeepResearchFrameTree }>;
@@ -496,6 +1201,9 @@ async function readDeepResearchFrameResult(
     typeof pageWithFrames.getFrameTree !== "function" ||
     typeof pageWithFrames.createIsolatedWorld !== "function"
   ) {
+    return null;
+  }
+  if (requireScopedTargetOwner && minTurnIndex < 0) {
     return null;
   }
   const frameTree = (await pageWithFrames.getFrameTree())?.frameTree;
@@ -513,21 +1221,30 @@ async function readDeepResearchFrameResult(
         oraclePageSessionId?: string;
       })
     | undefined;
-  if (minTurnIndex >= 0) {
-    if (typeof rawClient?.send !== "function") {
-      return null;
-    }
+  if (minTurnIndex >= 0 && requireScopedTargetOwner && typeof rawClient?.send !== "function") {
+    return null;
+  }
+  if (typeof rawClient?.send === "function") {
+    await rawClient.send("DOM.enable", {}, rawClient.oraclePageSessionId).catch(() => undefined);
+    await rawClient
+      .send("Runtime.enable", {}, rawClient.oraclePageSessionId)
+      .catch(() => undefined);
   }
   let best: DeepResearchFrameReadResult | null = null;
   for (const frameId of frameIds) {
-    let ownerTurnIndex: number | null = null;
-    if (minTurnIndex >= 0 && rawClient?.send) {
-      ownerTurnIndex = await readDeepResearchTargetOwnerTurnIndex(
+    let ownerMeta: DeepResearchTurnMetadata | null = null;
+    if (rawClient?.send) {
+      ownerMeta = await readDeepResearchTargetOwnerTurnMetadata(
         rawClient as ChromeClient & { send: NonNullable<typeof rawClient.send> },
         frameId,
         rawClient.oraclePageSessionId,
       );
-      if (ownerTurnIndex === null || ownerTurnIndex < minTurnIndex) {
+    }
+    if (minTurnIndex >= 0) {
+      if (
+        requireScopedTargetOwner &&
+        !isEligibleScopedDeepResearchOwnerPosition(ownerMeta, minTurnIndex)
+      ) {
         continue;
       }
     }
@@ -548,8 +1265,61 @@ async function readDeepResearchFrameResult(
     if (!read) {
       continue;
     }
-    best = { read, ownerTurnIndex };
-    if (read.completed) {
+    if (read.completed && requireScopedTargetOwner && rawClient?.send) {
+      const ownerAfter = await readDeepResearchTargetOwnerTurnMetadata(
+        rawClient as ChromeClient & { send: NonNullable<typeof rawClient.send> },
+        frameId,
+        rawClient.oraclePageSessionId,
+      );
+      if (
+        !isEligibleScopedDeepResearchOwnerPosition(ownerAfter, minTurnIndex) ||
+        !isSameDeepResearchOwner(ownerMeta, ownerAfter)
+      ) {
+        continue;
+      }
+      ownerMeta = ownerAfter;
+    }
+    const readWithFingerprint =
+      read.completed && read.text
+        ? { ...read, contentSha256: fingerprintDeepResearchContent(read.text) }
+        : read;
+    const citationApplied =
+      readWithFingerprint.completed && readWithFingerprint.text
+        ? applyDeepResearchCitationSources(
+            readWithFingerprint.text,
+            [],
+            readWithFingerprint.citationMarkerNonce,
+            [],
+            false,
+          )
+        : null;
+    const normalizedRead = citationApplied
+      ? {
+          ...readWithFingerprint,
+          text: citationApplied.markdown,
+          ...(citationApplied.status ? { citationStatus: citationApplied.status } : {}),
+        }
+      : readWithFingerprint;
+    const enrichedOwnerMeta =
+      normalizedRead.completed && ownerMeta && rawClient?.send
+        ? await enrichDeepResearchTurnMetadataFromConversationRecord(
+            rawClient as ChromeClient & { send: NonNullable<typeof rawClient.send> },
+            ownerMeta,
+            rawClient.oraclePageSessionId,
+          )
+        : ownerMeta;
+    if (
+      normalizedRead.completed &&
+      requireScopedTargetOwner &&
+      !isEligibleScopedDeepResearchOwner(enrichedOwnerMeta, minTurnIndex)
+    ) {
+      continue;
+    }
+    const readWithMeta = enrichedOwnerMeta
+      ? { ...normalizedRead, meta: enrichedOwnerMeta }
+      : normalizedRead;
+    best = { read: readWithMeta, ownerMeta: enrichedOwnerMeta };
+    if (normalizedRead.completed) {
       return best;
     }
   }
@@ -560,6 +1330,11 @@ async function readDeepResearchTargetResult(
   client: ChromeClient,
   ignoredTargetKeys: ReadonlySet<string> = new Set(),
   minTurnIndex = -1,
+  requireScopedTargetOwner = false,
+  enrichCompletedOwnerMetadata = false,
+  targetBaselineById: ReadonlyMap<string, DeepResearchTargetBaseline> = new Map(),
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
 ): Promise<DeepResearchTargetScanResult | null> {
   const rawClient = client as ChromeClient & {
     send?: (
@@ -573,6 +1348,9 @@ async function readDeepResearchTargetResult(
     return null;
   }
   if (typeof client.on !== "function") {
+    return null;
+  }
+  if (requireScopedTargetOwner && minTurnIndex < 0) {
     return null;
   }
 
@@ -637,10 +1415,8 @@ async function readDeepResearchTargetResult(
     }
     await delay(100);
 
-    if (minTurnIndex >= 0) {
-      await rawClient.send("DOM.enable", {}, pageSessionId).catch(() => undefined);
-      await rawClient.send("Runtime.enable", {}, pageSessionId).catch(() => undefined);
-    }
+    await rawClient.send("DOM.enable", {}, pageSessionId).catch(() => undefined);
+    await rawClient.send("Runtime.enable", {}, pageSessionId).catch(() => undefined);
 
     // Baseline targets and owner turns before the submitted prompt are removed
     // first. Among remaining targets, a completed report is authoritative;
@@ -648,32 +1424,135 @@ async function readDeepResearchTargetResult(
     let completed: DeepResearchFrameStatus | null = null;
     let latestProgress: DeepResearchFrameStatus | null = null;
     const targetKeys: string[] = [];
+    const capturedBaselineById = new Map<string, DeepResearchTargetBaseline>();
     for (const [sessionId, target] of sessions) {
+      const capturedBaseline = target.targetId
+        ? targetBaselineById.get(target.targetId)
+        : undefined;
+      // ChatGPT can create the Deep Research OOPIF when the capability is
+      // selected, before the user prompt is submitted, and then reuse that
+      // exact target for the completed report. A target-id baseline alone
+      // therefore cannot permanently exclude the target. Reconsider a reused
+      // target only when the current run has a mandatory conversation-turn
+      // boundary; the owner check below must then prove that the report belongs
+      // to a turn at or after that boundary. Unscoped scans retain the strict
+      // pre-submission target exclusion.
+      if (
+        shouldSkipDeepResearchTarget(
+          target.targetId,
+          ignoredTargetKeys,
+          capturedBaseline !== undefined,
+          minTurnIndex,
+          requireScopedTargetOwner,
+        )
+      ) {
+        continue;
+      }
       const sessionResult = await readDeepResearchTargetSession(rawClient, sessionId, target.url);
       if (!sessionResult.confirmed) {
         continue;
       }
       if (target.targetId) {
         targetKeys.push(target.targetId);
+        capturedBaselineById.set(target.targetId, {
+          targetId: target.targetId,
+          completed: sessionResult.read ? sessionResult.read.completed === true : null,
+          ...(sessionResult.read?.contentSha256
+            ? { contentSha256: sessionResult.read.contentSha256 }
+            : {}),
+        });
       }
-      if (target.targetId && ignoredTargetKeys.has(target.targetId)) {
-        continue;
-      }
+      let ownerMeta = sessionResult.frameId
+        ? await readDeepResearchTargetOwnerTurnMetadata(
+            rawClient,
+            sessionResult.frameId,
+            pageSessionId,
+          )
+        : null;
       if (minTurnIndex >= 0) {
-        const ownerTurnIndex = sessionResult.frameId
-          ? await readDeepResearchTargetOwnerTurnIndex(
-              rawClient,
-              sessionResult.frameId,
-              pageSessionId,
-            )
-          : null;
-        if (ownerTurnIndex === null || ownerTurnIndex < minTurnIndex) {
+        if (
+          requireScopedTargetOwner &&
+          !isEligibleScopedDeepResearchOwnerPosition(ownerMeta, minTurnIndex)
+        ) {
           continue;
         }
       }
-      const value = sessionResult.read;
+
+      // Bind a completed report to a stable owner: owner-before, fresh report
+      // read, owner-after. Persist only the middle read. This prevents a DOM
+      // remount from pairing old report bytes with a newly reparented turn.
+      let verifiedSessionResult = sessionResult;
+      if (sessionResult.read?.completed && requireScopedTargetOwner) {
+        const rawOwnerBefore = ownerMeta;
+        const ownerBefore =
+          enrichCompletedOwnerMetadata && rawOwnerBefore
+            ? await enrichDeepResearchTurnMetadataFromConversationRecord(
+                rawClient,
+                rawOwnerBefore,
+                pageSessionId,
+                expectedConversationId,
+                expectedUserMessageId,
+              )
+            : rawOwnerBefore;
+        if (
+          !isEligibleScopedDeepResearchOwnerPosition(rawOwnerBefore, minTurnIndex) ||
+          (enrichCompletedOwnerMetadata &&
+            !isAuthoritativeDeepResearchOwner(ownerBefore, minTurnIndex))
+        ) {
+          continue;
+        }
+        const reread = await readDeepResearchTargetSession(rawClient, sessionId, target.url);
+        const rawOwnerAfter = reread.frameId
+          ? await readDeepResearchTargetOwnerTurnMetadata(rawClient, reread.frameId, pageSessionId)
+          : null;
+        const ownerAfter =
+          enrichCompletedOwnerMetadata && rawOwnerAfter
+            ? await enrichDeepResearchTurnMetadataFromConversationRecord(
+                rawClient,
+                rawOwnerAfter,
+                pageSessionId,
+                expectedConversationId,
+                expectedUserMessageId,
+              )
+            : rawOwnerAfter;
+        if (
+          !reread.confirmed ||
+          !reread.read?.completed ||
+          reread.frameId !== sessionResult.frameId ||
+          !hasStableCompletedDeepResearchRead(sessionResult.read, reread.read) ||
+          !isEligibleScopedDeepResearchOwnerPosition(rawOwnerAfter, minTurnIndex) ||
+          (enrichCompletedOwnerMetadata &&
+            !isAuthoritativeDeepResearchOwner(ownerAfter, minTurnIndex)) ||
+          !isSameDeepResearchOwner(rawOwnerBefore, rawOwnerAfter) ||
+          !isSameDeepResearchOwner(ownerBefore, ownerAfter)
+        ) {
+          continue;
+        }
+        verifiedSessionResult = reread;
+        ownerMeta = ownerAfter;
+      }
+      if (
+        verifiedSessionResult.read?.completed &&
+        requireScopedTargetOwner &&
+        !isEligibleScopedDeepResearchOwner(ownerMeta, minTurnIndex)
+      ) {
+        continue;
+      }
+
+      if (verifiedSessionResult.read?.completed && target.targetId && capturedBaseline) {
+        const currentContentSha256 = verifiedSessionResult.read.contentSha256;
+        if (!hasFreshDeepResearchContentProof(capturedBaseline, currentContentSha256)) {
+          continue;
+        }
+      }
+
+      const value = verifiedSessionResult.read
+        ? ownerMeta
+          ? { ...verifiedSessionResult.read, meta: ownerMeta }
+          : verifiedSessionResult.read
+        : null;
       if (value?.completed) {
-        completed = value;
+        completed = preferEarlierScopedRead(completed, value, minTurnIndex);
       } else if (value && (value.inProgress || value.textLength > 0)) {
         latestProgress = value;
       }
@@ -681,6 +1560,7 @@ async function readDeepResearchTargetResult(
     return {
       read: completed ?? latestProgress,
       targetKeys,
+      targetBaseline: Array.from(capturedBaselineById.values()),
     };
   } finally {
     await rawClient
@@ -706,14 +1586,20 @@ async function readDeepResearchTargetResult(
 }
 
 export async function captureDeepResearchTargetKeys(client: ChromeClient): Promise<string[]> {
+  return (await captureDeepResearchTargetBaseline(client)).map((entry) => entry.targetId);
+}
+
+export async function captureDeepResearchTargetBaseline(
+  client: ChromeClient,
+): Promise<DeepResearchTargetBaseline[]> {
   const scan = await readDeepResearchTargetResult(client);
   if (!scan) {
     throw new Error("Deep Research target baseline capture unavailable");
   }
-  return scan.targetKeys;
+  return scan.targetBaseline;
 }
 
-async function readDeepResearchTargetOwnerTurnIndex(
+async function readDeepResearchTargetOwnerTurnMetadata(
   rawClient: {
     send: (
       method: string,
@@ -723,7 +1609,7 @@ async function readDeepResearchTargetOwnerTurnIndex(
   },
   frameId: string,
   pageSessionId?: string,
-): Promise<number | null> {
+): Promise<DeepResearchTurnMetadata | null> {
   const owner = (await rawClient
     .send("DOM.getFrameOwner", { frameId }, pageSessionId)
     .catch(() => null)) as { backendNodeId?: number } | null;
@@ -746,22 +1632,827 @@ async function readDeepResearchTargetOwnerTurnIndex(
           functionDeclaration: `function() {
             const turns = ${buildConversationTurnListExpression()};
             const index = turns.findIndex((turn) => turn === this || turn.contains?.(this));
-            return index >= 0 ? index : null;
+            if (index < 0) return null;
+            const turn = turns[index];
+            const assistantSelector = ${JSON.stringify(ASSISTANT_ROLE_SELECTOR)};
+            const messageRoot =
+              (turn.matches?.(assistantSelector) ? turn : null) ||
+              turn.querySelector?.(assistantSelector) ||
+              turn.querySelector?.('.agent-turn') ||
+              (turn.querySelector?.('iframe[src*="connector_openai_deep_research"], iframe[src*="deep-research"]')
+                ? turn
+                : null) ||
+              null;
+            if (!messageRoot) return null;
+            const normalizeMessageId = (value) => {
+              const candidate = typeof value === 'string' ? value.trim() : '';
+              return candidate &&
+                !/^request-web:/i.test(candidate) &&
+                !/^conversation-turn-\\d+$/i.test(candidate)
+                ? candidate
+                : null;
+            };
+            // The outer conversation-turn ID is authoritative. Nested app nodes
+            // can expose request-WEB:* IDs that are not conversation-record IDs.
+            const messageIdCandidates = [
+              turn.getAttribute?.('data-turn-id') ||
+                null,
+              turn.getAttribute?.('data-turn-id-container') ||
+                null,
+              turn.getAttribute?.('data-message-id') ||
+                null,
+              messageRoot.getAttribute?.('data-message-id') ||
+                null,
+              messageRoot.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id') ||
+                null,
+              messageRoot.getAttribute?.('data-turn-id') ||
+                null,
+              messageRoot.querySelector?.('[data-turn-id]')?.getAttribute?.('data-turn-id') ||
+                null,
+              messageRoot.getAttribute?.('data-turn-id-container') ||
+                null,
+              messageRoot.querySelector?.('[data-turn-id-container]')?.getAttribute?.('data-turn-id-container') ||
+                null,
+            ];
+            const messageId = messageIdCandidates.map(normalizeMessageId).find(Boolean) || null;
+            const turnId =
+              messageRoot.getAttribute?.('data-testid') ||
+              turn.getAttribute?.('data-testid') ||
+              null;
+            const modelSlug =
+              messageRoot.getAttribute?.('data-message-model-slug') ||
+              turn.getAttribute?.('data-message-model-slug') ||
+              messageRoot.querySelector?.('[data-message-model-slug]')?.getAttribute?.('data-message-model-slug') ||
+              null;
+            return { messageId, turnId, turnIndex: index, modelSlug };
           }`,
           returnByValue: true,
         },
         pageSessionId,
       )
       .catch(() => null)) as { result?: { value?: unknown } } | null;
-    const value = response?.result?.value;
-    return typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? Math.floor(value)
-      : null;
+    return normalizeDeepResearchTurnMetadata(response?.result?.value);
   } finally {
     await rawClient
       .send("Runtime.releaseObject", { objectId }, pageSessionId)
       .catch(() => undefined);
   }
+}
+
+function buildDeepResearchConversationRecordMetadataExpression(
+  messageId: string | null,
+  timeoutMs = 8_000,
+  expectedTurnIndex?: number,
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
+): string {
+  return `(async () => {
+    // oracle-deep-research-conversation-record-metadata
+    const expectedMessageId = ${JSON.stringify(messageId)};
+    const expectedTurnIndex = ${JSON.stringify(expectedTurnIndex ?? null)};
+    const expectedConversationId = ${JSON.stringify(expectedConversationId ?? null)};
+    const expectedUserMessageId = ${JSON.stringify(expectedUserMessageId ?? null)};
+    const asString = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
+    const normalizePromptComparable = (value) =>
+      String(value || '')
+        .replace(/\\r\\n?/g, '\\n')
+        .trim()
+        .replace(/^@?deep research\\b[ \\t\\n]*/i, '')
+        .trim();
+    const readDomBinding = () => {
+      if (expectedMessageId) return null;
+      const turns = ${buildConversationTurnListExpression()};
+      const reportTurn = turns[expectedTurnIndex];
+      if (!reportTurn) return null;
+      const reportRole = reportTurn?.getAttribute?.('data-message-author-role') ||
+        reportTurn?.getAttribute?.('data-turn') ||
+        (reportTurn?.querySelector?.('[data-message-author-role="assistant"], [data-turn="assistant"], .agent-turn')
+          ? 'assistant'
+          : null);
+      if (reportRole !== 'assistant') return null;
+      const priorDomUsers = [];
+      for (let index = 0; index < expectedTurnIndex; index += 1) {
+        const candidate = turns[index];
+        const role = candidate?.getAttribute?.('data-message-author-role') ||
+          candidate?.getAttribute?.('data-turn') ||
+          (candidate?.querySelector?.('[data-message-author-role="user"], [data-turn="user"]')
+            ? 'user'
+            : null);
+        if (role === 'user') priorDomUsers.push(candidate);
+      }
+      const priorDomUser = priorDomUsers[priorDomUsers.length - 1] || null;
+      const priorDomText = normalizePromptComparable(
+        priorDomUser?.innerText || priorDomUser?.textContent || '',
+      );
+      if (!priorDomUser || !priorDomText) return null;
+      const nodeKey = (node) => asString(
+        node?.getAttribute?.('data-testid') ||
+        node?.getAttribute?.('data-turn-id') ||
+        node?.getAttribute?.('data-turn-id-container'),
+      );
+      const transientNodeKey = (node) => {
+        const values = [
+          node?.getAttribute?.('data-message-id'),
+          node?.getAttribute?.('data-turn-id'),
+          node?.getAttribute?.('data-turn-id-container'),
+          node?.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id'),
+          node?.querySelector?.('[data-turn-id]')?.getAttribute?.('data-turn-id'),
+          node?.querySelector?.('[data-turn-id-container]')?.getAttribute?.('data-turn-id-container'),
+        ].map(asString).filter(Boolean);
+        return values.length > 0 ? Array.from(new Set(values)).join('\\n') : null;
+      };
+      const recordMessageIds = (node) => Array.from(new Set([
+        node?.getAttribute?.('data-message-id'),
+        node?.querySelector?.('[data-message-id]')?.getAttribute?.('data-message-id'),
+        node?.getAttribute?.('data-turn-id'),
+        node?.querySelector?.('[data-turn-id]')?.getAttribute?.('data-turn-id'),
+        node?.getAttribute?.('data-turn-id-container'),
+        node?.querySelector?.('[data-turn-id-container]')?.getAttribute?.('data-turn-id-container'),
+      ].map(asString).filter((candidate) =>
+        candidate &&
+        !/^request-web:/i.test(candidate) &&
+        !/^conversation-turn-\\d+$/i.test(candidate)
+      )));
+      return {
+        priorDomText,
+        priorUserOrdinal: priorDomUsers.length - 1,
+        priorUserKey: nodeKey(priorDomUser),
+        priorUserMessageIds: recordMessageIds(priorDomUser),
+        reportTurnKey: nodeKey(reportTurn),
+        reportTransientKey: transientNodeKey(reportTurn),
+      };
+    };
+    try {
+      const protocol = String(location.protocol || '').toLowerCase();
+      const hostname = String(location.hostname || '').toLowerCase();
+      const port = String(location.port || '');
+      const allowedHostname = hostname === 'chatgpt.com' || hostname === 'chat.openai.com';
+      if (protocol !== 'https:' || !allowedHostname || (port && port !== '443')) return null;
+      const conversationMatch = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/);
+      const conversationId = conversationMatch?.[1] || null;
+      if (
+        !conversationId ||
+        (expectedConversationId && conversationId !== expectedConversationId) ||
+        (!expectedMessageId && !Number.isInteger(expectedTurnIndex))
+      ) return null;
+      const initialDomBinding = expectedMessageId ? null : readDomBinding();
+      if (!expectedMessageId && !initialDomBinding) return null;
+
+      // This runs inside the user's authenticated ChatGPT page. The bearer token
+      // never leaves that browser context; only the compact, allowlisted turn
+      // metadata below is returned over CDP.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
+      let record;
+      try {
+        const authResponse = await fetch('/api/auth/session', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          redirect: 'error',
+          signal: controller.signal,
+        });
+        if (!authResponse.ok) return null;
+        const auth = await authResponse.json();
+        const accessToken = asString(auth?.accessToken);
+        if (!accessToken) return null;
+        const recordResponse = await fetch(
+          '/backend-api/conversation/' + encodeURIComponent(conversationId),
+          {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            redirect: 'error',
+            signal: controller.signal,
+            headers: { authorization: 'Bearer ' + accessToken },
+          },
+        );
+        if (!recordResponse.ok) return null;
+        record = await recordResponse.json();
+      } finally {
+        clearTimeout(timeout);
+      }
+      const mapping = record?.mapping;
+      if (!mapping || typeof mapping !== 'object') return null;
+
+      const currentBranch = [];
+      const seen = new Set();
+      let cursor = record?.current_node;
+      if (typeof cursor !== 'string' || !cursor) return null;
+      let branchInvalid = false;
+      while (typeof cursor === 'string' && cursor) {
+        if (seen.has(cursor) || currentBranch.length >= 10_000) {
+          branchInvalid = true;
+          break;
+        }
+        seen.add(cursor);
+        const node = mapping[cursor];
+        if (!node) {
+          branchInvalid = true;
+          break;
+        }
+        currentBranch.push(node);
+        if (node.parent == null) {
+          cursor = null;
+          break;
+        }
+        if (typeof node.parent !== 'string' || !node.parent) {
+          branchInvalid = true;
+          break;
+        }
+        cursor = node.parent;
+      }
+      if (branchInvalid) return null;
+      currentBranch.reverse();
+      const messageText = (message) => {
+        const content = message?.content;
+        if (typeof content?.text === 'string') return content.text;
+        if (Array.isArray(content?.parts)) {
+          return content.parts.filter((part) => typeof part === 'string').join('\\n');
+        }
+        return '';
+      };
+      let owner = null;
+      let priorUser = null;
+      if (expectedMessageId) {
+        const matchingBranchOwners = currentBranch.filter(
+          (node) =>
+            node?.message?.id === expectedMessageId &&
+            node?.message?.author?.role === 'assistant',
+        );
+        if (matchingBranchOwners.length !== 1) return null;
+        owner = matchingBranchOwners[0];
+      } else {
+        const priorDomText = initialDomBinding?.priorDomText;
+        const priorUserOrdinal = initialDomBinding?.priorUserOrdinal;
+        const priorUserMessageIds = initialDomBinding?.priorUserMessageIds;
+        if (
+          !priorDomText ||
+          !Number.isInteger(priorUserOrdinal) ||
+          !Array.isArray(priorUserMessageIds) ||
+          priorUserMessageIds.length === 0
+        ) return null;
+        const branchUsers = currentBranch.filter(
+          (node) => node?.message?.author?.role === 'user',
+        );
+        const matchingBranchUsers = branchUsers.filter((node) => {
+          const message = node?.message;
+          return Boolean(
+            priorUserMessageIds.includes(asString(message?.id)) &&
+            asString(message?.metadata?.deep_research_version) &&
+            normalizePromptComparable(messageText(message)) === priorDomText
+          );
+        });
+        // The prior visible user turn must name exactly one record message on
+        // the active branch; prompt/ordinal agreement alone is only heuristic.
+        if (matchingBranchUsers.length !== 1) return null;
+        priorUser = matchingBranchUsers[0];
+        const priorMessage = priorUser?.message;
+        const requestId = asString(priorMessage?.metadata?.request_id);
+        if (!requestId) return null;
+        const priorUserIndex = currentBranch.indexOf(priorUser);
+        if (priorUserIndex < 0) return null;
+        const belongsToPriorUserSegment = (candidate) => {
+          const visited = new Set();
+          let cursor = candidate;
+          while (cursor) {
+            const key = asString(cursor?.message?.id) || asString(cursor?.id);
+            if (key && visited.has(key)) return false;
+            if (key) visited.add(key);
+            const parentId = asString(cursor?.parent);
+            if (!parentId) return false;
+            const parent = mapping[parentId];
+            if (!parent) return false;
+            if (parent?.message?.author?.role === 'user') {
+              return parent?.message?.id === priorMessage?.id;
+            }
+            cursor = parent;
+          }
+          return false;
+        };
+        const allMatchingOwners = Object.values(mapping).filter((node) => {
+          const ownerMessage = node?.message;
+          return (
+            ownerMessage?.author?.role === 'assistant' &&
+            ownerMessage?.recipient === 'api_tool.call_tool' &&
+            ownerMessage?.end_turn !== true &&
+            asString(ownerMessage?.metadata?.request_id) === requestId &&
+            belongsToPriorUserSegment(node)
+          );
+        });
+        // Regenerated sibling reports can share the exact user message. Without
+        // a report-specific record ID, more than one eligible owner is ambiguous.
+        if (allMatchingOwners.length !== 1) return null;
+        const segment = [];
+        for (const node of currentBranch.slice(priorUserIndex + 1)) {
+          if (node?.message?.author?.role === 'user') break;
+          segment.push(node);
+        }
+        const matchingOwners = segment.filter((node) => {
+          const ownerMessage = node?.message;
+          return (
+            ownerMessage?.author?.role === 'assistant' &&
+            ownerMessage?.recipient === 'api_tool.call_tool' &&
+            ownerMessage?.end_turn !== true &&
+            asString(ownerMessage?.metadata?.request_id) === requestId
+          );
+        });
+        if (matchingOwners.length !== 1) return null;
+        owner = matchingOwners[0];
+        if (owner?.message?.id !== allMatchingOwners[0]?.message?.id) return null;
+        if (!owner || !priorUser) return null;
+      }
+
+      const ownerMessageId = asString(owner?.message?.id);
+      if (!ownerMessageId || owner?.message?.author?.role !== 'assistant') return null;
+      const ownerIndex = currentBranch.findIndex(
+        (node) => node === owner || node?.message?.id === ownerMessageId,
+      );
+      if (ownerIndex < 0) return null;
+
+      priorUser = priorUser || currentBranch
+        .slice(0, ownerIndex)
+        .reverse()
+        .find((node) => node?.message?.author?.role === 'user');
+      if (!priorUser) return null;
+      if (
+        expectedUserMessageId &&
+        asString(priorUser?.message?.id) !== expectedUserMessageId
+      ) return null;
+      const priorRequestId = asString(priorUser?.message?.metadata?.request_id);
+      const ownerRequestId = asString(owner?.message?.metadata?.request_id);
+      if (priorRequestId && ownerRequestId && priorRequestId !== ownerRequestId) return null;
+      const resolvedRequestId = priorRequestId || ownerRequestId;
+      const terminalCandidates = owner?.message?.end_turn === true ? [owner] : [];
+      for (const node of currentBranch.slice(ownerIndex + 1)) {
+        const role = node?.message?.author?.role;
+        if (role === 'user') break;
+        if (
+          role === 'assistant' &&
+          node?.message?.id !== ownerMessageId &&
+          node?.message?.end_turn === true
+        ) {
+          terminalCandidates.push(node);
+        }
+      }
+      if (terminalCandidates.length !== 1) return null;
+      const finalAssistant = terminalCandidates[0];
+      const finalRequestId = asString(finalAssistant?.message?.metadata?.request_id);
+      if (resolvedRequestId && finalRequestId && finalRequestId !== resolvedRequestId) return null;
+
+      const metadata = owner?.message?.metadata || {};
+      const modelSlug = asString(metadata.model_slug);
+      const defaultModelSlug = asString(metadata.default_model_slug);
+      if (!expectedMessageId) {
+        const finalDomBinding = readDomBinding();
+        if (
+          !initialDomBinding ||
+          !finalDomBinding ||
+          finalDomBinding.priorDomText !== initialDomBinding.priorDomText ||
+          finalDomBinding.priorUserOrdinal !== initialDomBinding.priorUserOrdinal ||
+          finalDomBinding.priorUserKey !== initialDomBinding.priorUserKey ||
+          finalDomBinding.priorUserMessageIds.join('\\n') !==
+            initialDomBinding.priorUserMessageIds.join('\\n') ||
+          finalDomBinding.reportTurnKey !== initialDomBinding.reportTurnKey
+          || !initialDomBinding.reportTransientKey
+          || finalDomBinding.reportTransientKey !== initialDomBinding.reportTransientKey
+        ) return null;
+      }
+      const finalConversationMatch = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/);
+      if (finalConversationMatch?.[1] !== conversationId) return null;
+      return {
+        messageId: ownerMessageId,
+        finalMessageId: asString(finalAssistant?.message?.id),
+        // Preserve the record's exact, distinct fields. The owner message's
+        // model_slug does not claim the identity of hidden research workers.
+        modelSlug,
+        resolvedModelSlug: asString(metadata.resolved_model_slug),
+        defaultModelSlug,
+        deepResearchVersion: asString(priorUser?.message?.metadata?.deep_research_version),
+        metadataSource: 'chatgpt-conversation-record',
+      };
+    } catch {
+      return null;
+    }
+  })()`;
+}
+
+async function enrichDeepResearchTurnMetadataFromConversationRecord(
+  rawClient: {
+    send: (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+    ) => Promise<unknown>;
+  },
+  meta: DeepResearchTurnMetadata | null,
+  pageSessionId?: string,
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
+): Promise<DeepResearchTurnMetadata | null> {
+  const normalized = normalizeDeepResearchTurnMetadata(meta);
+  const messageId = normalized?.messageId;
+  const turnIndex = normalized?.turnIndex;
+  if (!normalized || (!messageId && typeof turnIndex !== "number")) {
+    return normalized;
+  }
+  const response = (await rawClient
+    .send(
+      "Runtime.evaluate",
+      {
+        expression: buildDeepResearchConversationRecordMetadataExpression(
+          messageId ?? null,
+          8_000,
+          messageId || typeof turnIndex !== "number" ? undefined : turnIndex,
+          expectedConversationId,
+          expectedUserMessageId,
+        ),
+        awaitPromise: true,
+        returnByValue: true,
+      },
+      pageSessionId,
+    )
+    .catch(() => null)) as { result?: { value?: unknown } } | null;
+  const recordMeta = normalizeDeepResearchTurnMetadata(response?.result?.value);
+  if (
+    !recordMeta?.messageId ||
+    (messageId && recordMeta.messageId !== messageId) ||
+    recordMeta.metadataSource !== "chatgpt-conversation-record"
+  ) {
+    return expectedConversationId ? null : normalized;
+  }
+  return normalizeDeepResearchTurnMetadata({
+    ...normalized,
+    messageId: recordMeta.messageId,
+    // Once the authenticated conversation record is authoritative, absence is
+    // evidence too. Never backfill a missing record field from DOM attributes.
+    finalMessageId: recordMeta.finalMessageId ?? null,
+    modelSlug: recordMeta.modelSlug ?? null,
+    resolvedModelSlug: recordMeta.resolvedModelSlug ?? null,
+    defaultModelSlug: recordMeta.defaultModelSlug ?? null,
+    deepResearchVersion: recordMeta.deepResearchVersion ?? null,
+    metadataSource: recordMeta.metadataSource,
+  });
+}
+
+export async function enrichDeepResearchTurnMetadataFromConversationRecordForTest(
+  rawClient: {
+    send: (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+    ) => Promise<unknown>;
+  },
+  meta: DeepResearchTurnMetadata | null,
+  pageSessionId?: string,
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
+): Promise<DeepResearchTurnMetadata | null> {
+  return enrichDeepResearchTurnMetadataFromConversationRecord(
+    rawClient,
+    meta,
+    pageSessionId,
+    expectedConversationId,
+    expectedUserMessageId,
+  );
+}
+
+export function buildDeepResearchConversationRecordMetadataExpressionForTest(
+  messageId: string,
+  timeoutMs?: number,
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
+): string {
+  return buildDeepResearchConversationRecordMetadataExpression(
+    messageId,
+    timeoutMs,
+    undefined,
+    expectedConversationId,
+    expectedUserMessageId,
+  );
+}
+
+export function buildDeepResearchActiveRecordMetadataExpressionForTest(
+  turnIndex: number,
+  timeoutMs?: number,
+  expectedConversationId?: string,
+  expectedUserMessageId?: string,
+): string {
+  return buildDeepResearchConversationRecordMetadataExpression(
+    null,
+    timeoutMs,
+    turnIndex,
+    expectedConversationId,
+    expectedUserMessageId,
+  );
+}
+
+function buildDeepResearchCitationSourcesExpression(scope?: {
+  rootComparable?: string;
+  reportNeedle?: string;
+}): string {
+  return `(() => {
+    // oracle-deep-research-citation-sources
+    const expectedRootComparable = ${JSON.stringify(scope?.rootComparable ?? null)};
+    const expectedReportNeedle = ${JSON.stringify(scope?.reportNeedle ?? null)};
+    const asLabel = (value) => typeof value === 'string' && value.trim()
+      ? value.trim().slice(0, 500)
+      : null;
+    const sanitizeUrl = (value) => {
+      const raw = typeof value === 'string' ? value.trim() : '';
+      if (!raw || raw.length > 4096) return null;
+      try {
+        const parsed = new URL(raw, location.href);
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : null;
+      } catch {
+        return null;
+      }
+    };
+    const sources = [];
+    const observedIndexes = new Set();
+    const normalizeComparable = (value) =>
+      String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const isHiddenElement = (element) => {
+      if (!element) return false;
+      if (
+        element.hidden ||
+        element.getAttribute?.('aria-hidden') === 'true' ||
+        typeof element.getAttribute?.('hidden') === 'string'
+      ) return true;
+      const inlineStyle = String(element.getAttribute?.('style') || '').toLowerCase();
+      if (/display\\s*:\\s*none|visibility\\s*:\\s*(?:hidden|collapse)/.test(inlineStyle)) {
+        return true;
+      }
+      if (typeof getComputedStyle === 'function') {
+        try {
+          const style = getComputedStyle(element);
+          if (
+            style?.display === 'none' ||
+            style?.visibility === 'hidden' ||
+            style?.visibility === 'collapse'
+          ) return true;
+        } catch {
+          return true;
+        }
+      }
+      return false;
+    };
+    const isVisibleInDocument = (element) => {
+      let cursor = element;
+      while (cursor) {
+        if (isHiddenElement(cursor)) return false;
+        cursor = cursor.parentElement;
+      }
+      return true;
+    };
+    let scanRoot = document;
+    if (expectedRootComparable && expectedReportNeedle) {
+      const roots = typeof document.querySelectorAll === 'function'
+        ? Array.from(document.querySelectorAll('article, main, [role="main"]'))
+        : [];
+      const matchingRoots = roots.filter((candidate) => {
+        const text = normalizeComparable(candidate?.innerText || candidate?.textContent || '');
+        return isVisibleInDocument(candidate) && text.includes(expectedReportNeedle);
+      });
+      const root = matchingRoots.sort((a, b) =>
+        normalizeComparable(a?.innerText || a?.textContent || '').length -
+        normalizeComparable(b?.innerText || b?.textContent || '').length
+      )[0] || (isVisibleInDocument(document.body) ? document.body : null);
+      const rootText = normalizeComparable(root?.innerText || root?.textContent || '');
+      if (!root || rootText !== expectedRootComparable) {
+        return null;
+      }
+      scanRoot = root;
+    }
+    const isVisibleWithinRoot = (element) => {
+      let cursor = element;
+      let sawRoot = scanRoot === document;
+      while (cursor) {
+        if (isHiddenElement(cursor)) return false;
+        if (cursor === scanRoot) sawRoot = true;
+        cursor = cursor.parentElement;
+      }
+      return sawRoot;
+    };
+    const chips = Array.from(scanRoot.querySelectorAll(
+      'sup[data-citation-interactive="true"][data-citation-index]'
+    )).filter(isVisibleWithinRoot);
+    for (const chip of chips) {
+      const index = Number(chip.getAttribute('data-citation-index'));
+      if (!Number.isInteger(index) || index < 1 || index > 999) continue;
+      observedIndexes.add(index);
+      const fiberKey = Object.keys(chip).find((key) => key.startsWith('__reactFiber$'));
+      if (!fiberKey) continue;
+      let fiber = chip[fiberKey];
+      const matchingItems = [];
+      for (let depth = 0; fiber && depth < 12; depth += 1, fiber = fiber.return) {
+        const candidate = fiber?.memoizedProps?.item;
+        if (candidate && Number(candidate.index) === index) {
+          matchingItems.push(candidate);
+        }
+      }
+      const candidateUrls = Array.from(
+        new Set(matchingItems.map((item) => sanitizeUrl(item?.url)).filter(Boolean))
+      );
+      // Multiple same-index React items can occur while the tree is updating.
+      // If they disagree, there is no exact chip-to-destination binding.
+      if (candidateUrls.length !== 1) continue;
+      const url = candidateUrls[0];
+      const item = matchingItems.find((candidate) => sanitizeUrl(candidate?.url) === url);
+      if (!item) continue;
+      const records = Array.isArray(item.reference?.items) ? item.reference.items : [];
+      const matchingRecord = records.find((record) => sanitizeUrl(record?.url) === url);
+      const label =
+        asLabel(matchingRecord?.title) ||
+        asLabel(item.attribution) ||
+        asLabel(matchingRecord?.attribution) ||
+        undefined;
+      sources.push({ index, url, ...(label ? { label } : {}) });
+    }
+    return {
+      observedIndexes: Array.from(observedIndexes).sort((a, b) => a - b),
+      sources,
+    };
+  })()`;
+}
+
+function normalizeDeepResearchCitationSources(
+  value: unknown,
+): DeepResearchCitationSourceScan | null {
+  const legacyArray = Array.isArray(value);
+  const rawObject =
+    !legacyArray && value && typeof value === "object"
+      ? (value as { observedIndexes?: unknown; sources?: unknown })
+      : null;
+  const rawSources = legacyArray ? value : rawObject?.sources;
+  const rawObservedIndexes = legacyArray
+    ? value.map((item) =>
+        item && typeof item === "object" ? (item as { index?: unknown }).index : null,
+      )
+    : rawObject?.observedIndexes;
+  if (!Array.isArray(rawSources) || !Array.isArray(rawObservedIndexes)) return null;
+
+  const observedIndexes = Array.from(
+    new Set(
+      rawObservedIndexes.filter(
+        (index): index is number =>
+          typeof index === "number" && Number.isInteger(index) && index >= 1 && index <= 999,
+      ),
+    ),
+  ).sort((a, b) => a - b);
+  const observedIndexSet = new Set(observedIndexes);
+  const seen = new Set<string>();
+  const normalized: DeepResearchCitationSource[] = [];
+  for (const item of rawSources) {
+    if (!item || typeof item !== "object") continue;
+    const raw = item as { index?: unknown; url?: unknown; label?: unknown };
+    const index =
+      typeof raw.index === "number" && Number.isInteger(raw.index) && raw.index >= 1
+        ? raw.index
+        : null;
+    const rawUrl = typeof raw.url === "string" ? raw.url.trim() : "";
+    if (
+      index === null ||
+      index > 999 ||
+      !observedIndexSet.has(index) ||
+      !rawUrl ||
+      rawUrl.length > 4096
+    ) {
+      continue;
+    }
+    let url: URL;
+    try {
+      url = new URL(rawUrl);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    const key = `${index}\n${url.href}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label = typeof raw.label === "string" ? raw.label.trim().slice(0, 500) : "";
+    normalized.push({ index, url: url.href, ...(label ? { label } : {}) });
+  }
+  return { observedIndexes, sources: normalized };
+}
+
+function applyDeepResearchCitationSources(
+  markdown: string,
+  sources: readonly DeepResearchCitationSource[],
+  citationMarkerNonce: string | undefined,
+  observedIndexes: readonly number[],
+  scanAvailable: boolean,
+  declaredCitationCount = 0,
+): { markdown: string; status?: DeepResearchCitationStatus } {
+  const marker = /^[a-f0-9]{32}$/.test(citationMarkerNonce ?? "")
+    ? new RegExp(`\\[\\[ORACLE_DEEP_RESEARCH_CITATION_${citationMarkerNonce}_(\\d+)\\]\\]`, "g")
+    : null;
+  const markerIndexes = marker
+    ? Array.from(new Set(Array.from(markdown.matchAll(marker), (match) => Number(match[1]))))
+    : [];
+  const declaredIndexes =
+    Number.isInteger(declaredCitationCount) && declaredCitationCount > 0
+      ? Array.from({ length: Math.min(declaredCitationCount, 999) }, (_value, index) => index + 1)
+      : [];
+  const indexes = Array.from(new Set([...markerIndexes, ...observedIndexes, ...declaredIndexes]))
+    .filter((index) => Number.isInteger(index) && index >= 1 && index <= 999)
+    .sort((a, b) => a - b);
+
+  const urlsByIndex = new Map<number, string[]>();
+  for (const source of sources) {
+    const urls = urlsByIndex.get(source.index) ?? [];
+    if (!urls.includes(source.url)) urls.push(source.url);
+    urlsByIndex.set(source.index, urls);
+  }
+  const exactUrlByIndex = new Map<number, string>();
+  for (const index of indexes) {
+    const urls = urlsByIndex.get(index) ?? [];
+    // Contradictory URLs for one displayed index are not guessed between.
+    if (urls.length === 1) exactUrlByIndex.set(index, urls[0]);
+  }
+  const markerIndexSet = new Set(markerIndexes);
+  const linkedIndexes = indexes.filter(
+    (index) => markerIndexSet.has(index) && exactUrlByIndex.has(index),
+  );
+  const rewrittenMarkdown = marker
+    ? markdown.replace(marker, (_match, rawIndex: string) => {
+        const index = Number(rawIndex);
+        const url = exactUrlByIndex.get(index);
+        return url ? `[${index}](<${url}>)` : `[${index}]`;
+      })
+    : markdown;
+  return {
+    markdown: rewrittenMarkdown,
+    ...(scanAvailable
+      ? {
+          status: {
+            total: indexes.length,
+            linked: linkedIndexes.length,
+            missingIndexes: indexes.filter((index) => !linkedIndexes.includes(index)),
+          },
+        }
+      : {}),
+  };
+}
+
+async function readDeepResearchCitationSources(
+  rawClient: {
+    send: (
+      method: string,
+      params?: Record<string, unknown>,
+      sessionId?: string,
+    ) => Promise<unknown>;
+  },
+  sessionId: string,
+  contextId: number | undefined,
+  scope?: { rootComparable?: string; reportNeedle?: string },
+): Promise<DeepResearchCitationSourceScan | null> {
+  if (typeof contextId !== "number" || !scope?.rootComparable || !scope?.reportNeedle) {
+    return null;
+  }
+  const response = (await rawClient
+    .send(
+      "Runtime.evaluate",
+      {
+        expression: buildDeepResearchCitationSourcesExpression(scope),
+        contextId,
+        returnByValue: true,
+      },
+      sessionId,
+    )
+    .catch(() => null)) as { result?: { value?: unknown } } | null;
+  return normalizeDeepResearchCitationSources(response?.result?.value);
+}
+
+export function buildDeepResearchCitationSourcesExpressionForTest(scope?: {
+  rootComparable?: string;
+  reportNeedle?: string;
+}): string {
+  return buildDeepResearchCitationSourcesExpression(scope);
+}
+
+export function applyDeepResearchCitationSourcesForTest(
+  markdown: string,
+  sources: readonly DeepResearchCitationSource[],
+  options: {
+    citationMarkerNonce?: string;
+    observedIndexes?: readonly number[];
+    scanAvailable?: boolean;
+    declaredCitationCount?: number;
+  } = {},
+): { markdown: string; status?: DeepResearchCitationStatus } {
+  return applyDeepResearchCitationSources(
+    markdown,
+    sources,
+    options.citationMarkerNonce,
+    options.observedIndexes ?? sources.map((source) => source.index),
+    options.scanAvailable ?? true,
+    options.declaredCitationCount ?? 0,
+  );
+}
+
+export function normalizeDeepResearchCitationSourcesForTest(
+  value: unknown,
+): DeepResearchCitationSourceScan | null {
+  return normalizeDeepResearchCitationSources(value);
 }
 
 async function readDeepResearchTargetSession(
@@ -771,60 +2462,141 @@ async function readDeepResearchTargetSession(
       params?: Record<string, unknown>,
       sessionId?: string,
     ) => Promise<unknown>;
+    on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+    removeListener?: (event: string, listener: (...args: unknown[]) => void) => unknown;
   },
   sessionId: string,
   targetUrl: string,
 ): Promise<DeepResearchTargetSessionResult> {
-  await rawClient.send("Runtime.enable", {}, sessionId).catch(() => undefined);
-  await rawClient.send("Page.enable", {}, sessionId).catch(() => undefined);
+  const defaultContextByFrame = new Map<string, number>();
+  const onExecutionContextCreated = (params: unknown, eventSessionId?: unknown) => {
+    if (typeof eventSessionId === "string" && eventSessionId !== sessionId) return;
+    const context = (
+      params as {
+        context?: {
+          id?: number;
+          auxData?: { frameId?: string; isDefault?: boolean };
+        };
+      }
+    )?.context;
+    const frameId = context?.auxData?.frameId;
+    if (
+      typeof context?.id === "number" &&
+      typeof frameId === "string" &&
+      context.auxData?.isDefault === true
+    ) {
+      defaultContextByFrame.set(frameId, context.id);
+    }
+  };
+  rawClient.on?.("Runtime.executionContextCreated", onExecutionContextCreated);
+  try {
+    // Runtime.enable replays existing execution contexts. Capture the default
+    // (main-world) context for each nested report frame; React citation metadata
+    // is intentionally not visible from the isolated world used for report text.
+    await rawClient.send("Runtime.enable", {}, sessionId).catch(() => undefined);
+    await rawClient.send("Page.enable", {}, sessionId).catch(() => undefined);
 
-  const frameTree = (await rawClient
-    .send("Page.getFrameTree", {}, sessionId)
-    .catch(() => null)) as { frameTree?: DeepResearchFrameTree } | null;
-  const ownerFrameId = frameTree?.frameTree?.frame?.id;
-  if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
-    return { confirmed: false, read: null };
-  }
-  const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
-  let best: DeepResearchFrameStatus | null = null;
+    const frameTree = (await rawClient
+      .send("Page.getFrameTree", {}, sessionId)
+      .catch(() => null)) as { frameTree?: DeepResearchFrameTree } | null;
+    const ownerFrameId = frameTree?.frameTree?.frame?.id;
+    if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
+      return { confirmed: false, read: null };
+    }
+    const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
+    let best: DeepResearchFrameStatus | null = null;
 
-  for (const frameId of frameIds) {
-    const world = (await rawClient
-      .send(
-        "Page.createIsolatedWorld",
-        {
-          frameId,
-          worldName: "oracle-deep-research",
-          grantUniveralAccess: true,
-        },
+    const addCitationEvidence = async (
+      value: DeepResearchFrameStatus,
+      frameId: string | undefined,
+    ): Promise<DeepResearchFrameStatus> => {
+      if (!value.completed || !value.text) return value;
+      const citationScan = await readDeepResearchCitationSources(
+        rawClient,
         sessionId,
-      )
-      .catch(() => null)) as { executionContextId?: number } | null;
-    if (typeof world?.executionContextId !== "number") {
-      continue;
-    }
-    const value = await evaluateDeepResearchFrameStatus(
-      rawClient,
-      sessionId,
-      world.executionContextId,
-    );
-    if (value?.completed) {
-      return { confirmed: true, read: value, frameId: ownerFrameId };
-    }
-    if ((value?.textLength ?? 0) > (best?.textLength ?? 0) || value?.inProgress) {
-      best = value;
-    }
-  }
+        frameId ? defaultContextByFrame.get(frameId) : undefined,
+        {
+          rootComparable: value.citationRootComparable,
+          reportNeedle: value.citationReportNeedle,
+        },
+      );
+      const applied = applyDeepResearchCitationSources(
+        value.text,
+        citationScan?.sources ?? [],
+        value.citationMarkerNonce,
+        citationScan?.observedIndexes ?? [],
+        hasVerifiedDeepResearchCitationUiContract(citationScan, value.declaredCitationCount),
+        value.declaredCitationCount ?? 0,
+      );
+      return {
+        ...value,
+        text: applied.markdown,
+        ...(applied.status ? { citationStatus: applied.status } : {}),
+      };
+    };
 
-  const topFrameValue = await evaluateDeepResearchFrameStatus(rawClient, sessionId);
-  if (topFrameValue?.completed) {
-    return { confirmed: true, read: topFrameValue, frameId: ownerFrameId };
-  }
-  if ((topFrameValue?.textLength ?? 0) > (best?.textLength ?? 0) || topFrameValue?.inProgress) {
-    best = topFrameValue;
-  }
+    for (const frameId of frameIds) {
+      const world = (await rawClient
+        .send(
+          "Page.createIsolatedWorld",
+          {
+            frameId,
+            worldName: "oracle-deep-research",
+            grantUniveralAccess: true,
+          },
+          sessionId,
+        )
+        .catch(() => null)) as { executionContextId?: number } | null;
+      if (typeof world?.executionContextId !== "number") {
+        continue;
+      }
+      const value = await evaluateDeepResearchFrameStatus(
+        rawClient,
+        sessionId,
+        world.executionContextId,
+      );
+      if (value?.completed) {
+        const completedValue = value.text
+          ? { ...value, contentSha256: fingerprintDeepResearchContent(value.text) }
+          : value;
+        return {
+          confirmed: true,
+          read: await addCitationEvidence(completedValue, frameId),
+          frameId: ownerFrameId,
+        };
+      }
+      if ((value?.textLength ?? 0) > (best?.textLength ?? 0) || value?.inProgress) {
+        best = value;
+      }
+    }
 
-  return { confirmed: true, read: best, frameId: ownerFrameId };
+    const topFrameValue = await evaluateDeepResearchFrameStatus(rawClient, sessionId);
+    if (topFrameValue?.completed) {
+      const completedValue = topFrameValue.text
+        ? {
+            ...topFrameValue,
+            contentSha256: fingerprintDeepResearchContent(topFrameValue.text),
+          }
+        : topFrameValue;
+      return {
+        confirmed: true,
+        read: await addCitationEvidence(completedValue, ownerFrameId),
+        frameId: ownerFrameId,
+      };
+    }
+    if ((topFrameValue?.textLength ?? 0) > (best?.textLength ?? 0) || topFrameValue?.inProgress) {
+      best = topFrameValue;
+    }
+
+    return { confirmed: true, read: best, frameId: ownerFrameId };
+  } finally {
+    // Each call installs a fresh execution-context listener. Runtime.enable is
+    // idempotent and Chrome need not replay existing contexts on a second call,
+    // so disable this Oracle-owned child session before the stable reread/poll.
+    // The next enable then produces a fresh, session-scoped main-world map.
+    await rawClient.send("Runtime.disable", {}, sessionId).catch(() => undefined);
+    rawClient.removeListener?.("Runtime.executionContextCreated", onExecutionContextCreated);
+  }
 }
 
 async function evaluateDeepResearchFrameStatus(
@@ -912,9 +2684,52 @@ function collectDeepResearchFrameIds(tree: DeepResearchFrameTree | undefined): s
 }
 
 function buildDeepResearchFrameStatusExpression(): string {
+  // A fresh 128-bit nonce makes serializer-inserted citation markers distinct
+  // from any literal marker-like text already present in the report.
+  const citationMarkerNonce = randomBytes(16).toString("hex");
   return `(() => {
+    const citationMarkerNonce = ${JSON.stringify(citationMarkerNonce)};
     const rawText = document.body?.innerText || '';
-    const html = document.body?.innerHTML || '';
+    const rawLines = String(rawText || '')
+      .split(/\\n+/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const reportChromeIndex = rawLines.findIndex((line) => /deep research report/i.test(line));
+    const chromeLines = reportChromeIndex >= 0
+      ? rawLines.slice(0, reportChromeIndex + 1)
+      : rawLines.slice(0, 12);
+    const citationCounterLabel =
+      '(?:citations?|sources?|cytaty|cytatów|źródła|źródeł)';
+    const declaredCitationCounts = [];
+    let citationCounterObserved = false;
+    for (let index = 0; index < chromeLines.length; index += 1) {
+      const line = chromeLines[index] || '';
+      const sameLine = line.match(new RegExp(
+        '^(?:' + citationCounterLabel + '\\\\s*[:：]?\\\\s*(\\\\d+)|(\\\\d+)\\\\s+' + citationCounterLabel + ')\\\\b',
+        'i',
+      ));
+      if (sameLine) {
+        const sameLineCount = Number(sameLine[1] ?? sameLine[2]);
+        if (Number.isInteger(sameLineCount) && sameLineCount >= 0 && sameLineCount <= 999) {
+          citationCounterObserved = true;
+          declaredCitationCounts.push(sameLineCount);
+        }
+      }
+      const standaloneCount = /^\\d+$/.test(line) ? Number(line) : null;
+      const nextLine = chromeLines[index + 1] || '';
+      if (
+        standaloneCount !== null &&
+        standaloneCount >= 0 &&
+        standaloneCount <= 999 &&
+        new RegExp('^' + citationCounterLabel + '\\\\b', 'i').test(nextLine)
+      ) {
+        citationCounterObserved = true;
+        declaredCitationCounts.push(standaloneCount);
+      }
+    }
+    const declaredCitationCount = citationCounterObserved
+      ? Math.max(...declaredCitationCounts)
+      : undefined;
     const isPlaceholder = (line) => /^(called tool|used tool|użyto narzędzia|narzędzie wywołane)$/i.test(line);
     const isCompletionLine = (line) =>
       /^(research completed|badanie ukończone)\\b/i.test(line);
@@ -949,16 +2764,246 @@ function buildDeepResearchFrameStatusExpression(): string {
       return reportLines.join('\\n').trim();
     };
     const reportText = normalizeReport(rawText);
+    const backslash = String.fromCharCode(92);
+    const backtick = String.fromCharCode(96);
+    const escapeMarkdownText = (value) => {
+      let escaped = String(value || '').split('&').join('&amp;');
+      escaped = escaped.split('<').join('&lt;').split('>').join('&gt;');
+      for (const char of [backslash, '*', '_', '[', ']', '|']) {
+        escaped = escaped.split(char).join(backslash + char);
+      }
+      return escaped;
+    };
+    const normalizeInlineText = (value) =>
+      escapeMarkdownText(value).replace(/\\s+/g, ' ');
+    const childNodesOf = (node) =>
+      Array.from(node?.childNodes || node?.children || []);
+    const tagNameOf = (node) => String(node?.tagName || '').toUpperCase();
+    const isHidden = (element) => {
+      if (!element) return false;
+      if (
+        element.hidden ||
+        element.getAttribute?.('aria-hidden') === 'true' ||
+        typeof element.getAttribute?.('hidden') === 'string'
+      ) return true;
+      const inlineStyle = String(element.getAttribute?.('style') || '').toLowerCase();
+      if (/display\\s*:\\s*none|visibility\\s*:\\s*(?:hidden|collapse)/.test(inlineStyle)) {
+        return true;
+      }
+      if (typeof getComputedStyle === 'function') {
+        try {
+          const style = getComputedStyle(element);
+          if (
+            style?.display === 'none' ||
+            style?.visibility === 'hidden' ||
+            style?.visibility === 'collapse'
+          ) return true;
+        } catch {
+          return true;
+        }
+      }
+      return false;
+    };
+    const isVisibleInDocument = (element) => {
+      let cursor = element;
+      while (cursor) {
+        if (isHidden(cursor)) return false;
+        cursor = cursor.parentElement;
+      }
+      return true;
+    };
+    const codeFence = (value, minimum) => {
+      let longest = 0;
+      let current = 0;
+      for (const char of String(value || '')) {
+        current = char === backtick ? current + 1 : 0;
+        longest = Math.max(longest, current);
+      }
+      return backtick.repeat(Math.max(minimum, longest + 1));
+    };
+    const sanitizeHref = (element) => {
+      const raw = element?.getAttribute?.('href') || element?.href || '';
+      if (!raw || typeof URL !== 'function') return null;
+      try {
+        const base = document.baseURI ||
+          (typeof location !== 'undefined' ? location.href : 'https://chatgpt.com/');
+        const url = new URL(raw, base);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+      } catch {
+        return null;
+      }
+    };
+    let serializeNode;
+    const preformattedText = (node) => {
+      if (!node) return '';
+      if (node.nodeType === 3) return String(node.textContent || '');
+      if (node.nodeType != null && node.nodeType !== 1) return '';
+      if (isHidden(node)) return '';
+      const tag = tagNameOf(node);
+      if (tag === 'BR') return '\\n';
+      if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'IFRAME', 'FORM', 'BUTTON', 'SVG', 'IMG'].includes(tag)) {
+        return '';
+      }
+      return childNodesOf(node).map((child) => preformattedText(child)).join('');
+    };
+    const serializeChildren = (node, depth = 0) =>
+      childNodesOf(node).map((child) => serializeNode(child, depth)).join('');
+    const serializeList = (element, depth) => {
+      const ordered = tagNameOf(element) === 'OL';
+      const items = Array.from(element?.children || []).filter((child) => tagNameOf(child) === 'LI');
+      return items.map((item, index) => {
+        const nested = [];
+        const direct = childNodesOf(item).map((child) => {
+          const tag = tagNameOf(child);
+          if (tag === 'UL' || tag === 'OL') {
+            nested.push(serializeList(child, depth + 1));
+            return '';
+          }
+          return serializeNode(child, depth + 1);
+        }).join('').replace(/\\s+/g, ' ').trim();
+        const prefix = ordered ? String(index + 1) + '. ' : '- ';
+        const indent = '  '.repeat(depth);
+        const nestedText = nested
+          .map((value) => '\\n' + String(value).split('\\n').map((line) => line ? '  ' + line : line).join('\\n'))
+          .join('');
+        return indent + prefix + direct + nestedText;
+      }).join('\\n') + '\\n\\n';
+    };
+    const serializeTable = (element) => {
+      const rows = Array.from(element?.querySelectorAll?.('tr') || []);
+      const values = rows.map((row) =>
+        Array.from(row.querySelectorAll?.('th, td') || []).map((cell) =>
+          serializeChildren(cell).replace(/\\s+/g, ' ').trim()
+        )
+      ).filter((row) => row.length > 0);
+      if (values.length === 0) return '';
+      const width = Math.max(...values.map((row) => row.length));
+      const pad = (row) => Array.from({ length: width }, (_, index) => row[index] || '');
+      const header = pad(values[0]);
+      const lines = [
+        '| ' + header.join(' | ') + ' |',
+        '| ' + header.map(() => '---').join(' | ') + ' |',
+        ...values.slice(1).map((row) => '| ' + pad(row).join(' | ') + ' |'),
+      ];
+      return '\\n\\n' + lines.join('\\n') + '\\n\\n';
+    };
+    serializeNode = (node, depth = 0) => {
+      if (!node) return '';
+      if (node.nodeType === 3) return normalizeInlineText(node.textContent || '');
+      if (node.nodeType != null && node.nodeType !== 1) return '';
+      if (isHidden(node)) return '';
+      const tag = tagNameOf(node);
+      if (['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'IFRAME', 'FORM', 'BUTTON', 'SVG', 'IMG'].includes(tag)) {
+        return '';
+      }
+      if (/^H[1-6]$/.test(tag)) {
+        return '\\n\\n' + '#'.repeat(Number(tag.slice(1))) + ' ' + serializeChildren(node, depth).trim() + '\\n\\n';
+      }
+      if (tag === 'BR') return '\\n';
+      if (tag === 'HR') return '\\n\\n---\\n\\n';
+      if (tag === 'STRONG' || tag === 'B') return '**' + serializeChildren(node, depth) + '**';
+      if (tag === 'EM' || tag === 'I') return '*' + serializeChildren(node, depth) + '*';
+      if (tag === 'A') {
+        const label = serializeChildren(node, depth).trim() || normalizeInlineText(node.textContent || '');
+        const href = sanitizeHref(node);
+        return href ? '[' + (label || href) + '](<' + href + '>)' : label;
+      }
+      if (
+        tag === 'SUP' &&
+        node.getAttribute?.('data-citation-interactive') === 'true'
+      ) {
+        const index = Number(node.getAttribute?.('data-citation-index'));
+        if (Number.isInteger(index) && index >= 1 && index <= 999) {
+          return '[[ORACLE_DEEP_RESEARCH_CITATION_' + citationMarkerNonce + '_' + String(index) + ']]';
+        }
+      }
+      if (tag === 'PRE') {
+        const value = preformattedText(node).replace(/^\\n+|\\n+$/g, '');
+        if (!value) return '';
+        const fence = codeFence(value, 3);
+        return '\\n\\n' + fence + '\\n' + value + '\\n' + fence + '\\n\\n';
+      }
+      if (tag === 'CODE') {
+        const value = preformattedText(node).replace(/\\s+/g, ' ').trim();
+        if (!value) return '';
+        const fence = codeFence(value, 1);
+        const padding = value.startsWith(backtick) || value.endsWith(backtick) ? ' ' : '';
+        return fence + padding + value + padding + fence;
+      }
+      if (tag === 'UL' || tag === 'OL') return '\\n' + serializeList(node, depth);
+      if (tag === 'LI') return serializeChildren(node, depth);
+      if (tag === 'BLOCKQUOTE') {
+        const value = serializeChildren(node, depth).trim();
+        return '\\n\\n' + value.split('\\n').map((line) => '> ' + line).join('\\n') + '\\n\\n';
+      }
+      if (tag === 'TABLE') return serializeTable(node);
+      const content = serializeChildren(node, depth);
+      if (['P', 'DIV', 'SECTION', 'ARTICLE', 'MAIN', 'HEADER', 'FOOTER', 'FIGURE', 'FIGCAPTION'].includes(tag)) {
+        return '\\n\\n' + content.trim() + '\\n\\n';
+      }
+      return content;
+    };
+    const normalizeComparable = (value) =>
+      String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const reportNeedle = normalizeComparable(reportText).slice(0, 120);
+    const roots = typeof document.querySelectorAll === 'function'
+      ? Array.from(document.querySelectorAll('article, main, [role="main"]'))
+      : [];
+    const matchingRoots = roots.filter((candidate) => {
+      const text = normalizeComparable(candidate?.innerText || candidate?.textContent || '');
+      return reportNeedle.length >= 20 && isVisibleInDocument(candidate) && text.includes(reportNeedle);
+    });
+    const root = matchingRoots.sort((a, b) =>
+      String(a?.innerText || a?.textContent || '').length -
+      String(b?.innerText || b?.textContent || '').length
+    )[0] || (isVisibleInDocument(document.body) ? document.body : null);
+    const citationRootComparable = normalizeComparable(
+      root?.innerText || root?.textContent || '',
+    );
+    const hasStructuredDom = childNodesOf(root).length > 0;
+    const cleanMarkdown = (value) => String(value || '')
+      .replace(/[ \\t]+\\n/g, '\\n')
+      .replace(/\\n[ \\t]+/g, '\\n')
+      .replace(/\\n{3,}/g, '\\n\\n')
+      .trim();
+    const stripLeadingChrome = (value) => {
+      let lines = cleanMarkdown(value).split('\\n');
+      const plainLine = (line) => line
+        .replace(/^#{1,6}\\s+/, '')
+        .split(backtick).join('')
+        .split('*').join('')
+        .split('_').join('')
+        .split(backslash).join('')
+        .trim();
+      const marker = lines.findIndex((line) => /deep research report/i.test(plainLine(line)));
+      if (marker >= 0) lines = lines.slice(marker + 1);
+      while (lines.length > 0) {
+        const line = plainLine(lines[0] || '');
+        if (!line || /^\\d+$/.test(line) || isCompletionLine(line) || isCounterLine(line) || isPlaceholder(line)) {
+          lines.shift();
+          continue;
+        }
+        break;
+      }
+      return cleanMarkdown(lines.join('\\n'));
+    };
+    const serialized = stripLeadingChrome(serializeNode(root));
+    const reportMarkdown = hasStructuredDom
+      ? serialized
+      : (serialized.length >= 40 ? serialized : reportText);
     const completed = /research completed|badanie ukończone/i.test(rawText) &&
-      reportText.length >= 40 &&
+      reportMarkdown.length >= 40 &&
       !isPlaceholder(reportText);
     const inProgress = /researching|badanie|searching|searches|wyszukiwa|citation|cytat|source|źród|reading|completed|ukończone/i.test(rawText);
     return {
       completed,
       inProgress,
       textLength: reportText.length || rawText.trim().length,
-      text: completed ? reportText : undefined,
-      html: completed ? html : undefined,
+      text: completed ? reportMarkdown : undefined,
+      citationMarkerNonce: completed ? citationMarkerNonce : undefined,
+      citationRootComparable: completed ? citationRootComparable : undefined,
+      citationReportNeedle: completed ? reportNeedle : undefined,
+      declaredCitationCount: completed ? declaredCitationCount : undefined,
     };
   })()`;
 }
@@ -1054,6 +3099,9 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
   const stopSelector = JSON.stringify(STOP_BUTTON_SELECTOR);
   return `(() => {
     const MIN_TURN_INDEX = ${minTurnIndex};
+    const conversationId = typeof location === 'undefined'
+      ? null
+      : (String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null);
     const stopVisible = Boolean(document.querySelector(${stopSelector}));
     const scopedToNewTurns = MIN_TURN_INDEX >= 0;
     const pageText = String(document.body?.innerText || '').toLowerCase().replace(/\\s+/g, ' ');
@@ -1110,7 +3158,7 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
     const hasActiveScopedResearch = scopedToNewTurns && Boolean(lastTurn) &&
       hasScopedDeepResearchIframe &&
       (textLength < 40 || isToolStub || tailIsPlanningPanel || /chatgpt\\s+said:?$/i.test(text));
-    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked };
+    return { finished, stopVisible, textLength, hasIframe, isToolStub, incompleteResult, researchActivity: tailIsPlanningPanel || (isToolStub && hasScopedDeepResearchIframe), hasActiveScopedResearch, accountBlocked, conversationId };
   })()`;
 }
 

@@ -1,4 +1,5 @@
 import { describe, expect, test, vi, afterEach, beforeEach } from "vitest";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -194,9 +195,28 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
+      const recoveredReport =
+        "# Deep report\n\nRecovered report body [1](<https://example.com/source>) [2]";
       resumeMock.mockResolvedValue({
-        answerText: "# Deep report\n\nRecovered report body.",
-        answerMarkdown: "# Deep report\n\nRecovered report body.",
+        answerText: recoveredReport,
+        answerMarkdown: recoveredReport,
+        assistantTurn: {
+          messageId: "message-fresh",
+          finalMessageId: "message-fresh-final",
+          turnId: "conversation-turn-4",
+          turnIndex: 3,
+          modelSlug: "gpt-5-5-instant",
+          resolvedModelSlug: "gpt-5-5-instant",
+          defaultModelSlug: "gpt-5-6-pro",
+          deepResearchVersion: "standard",
+          metadataSource: "chatgpt-conversation-record",
+          responseSha256: createHash("sha256").update(recoveredReport).digest("hex"),
+          capturedAt: "2026-07-15T00:00:00.000Z",
+        },
+        citationStatus: { total: 2, linked: 1, missingIndexes: [2] },
+        // Persistence must not trust this producer-supplied array. It must
+        // rebuild the citation warning from the fresh report/status pair.
+        warnings: [],
       });
 
       const { sessionStore } = await import("../../src/sessionStore.js");
@@ -222,12 +242,45 @@ describe("browser reattach end-to-end (simulated)", () => {
         usage: { inputTokens: 0, outputTokens: 3, reasoningTokens: 0, totalTokens: 3 },
         browser: {
           config: { researchMode: "deep" },
+          modelSelection: {
+            requestedModel: "Pro",
+            resolvedLabel: "Pro",
+            strategy: "select",
+            status: "already-selected",
+            verified: true,
+            source: "chatgpt-model-picker",
+            capturedAt: "2026-07-15T00:00:00.000Z",
+          },
           runtime: {
             chromePort: 51559,
             chromeHost: "127.0.0.1",
             chromeTargetId: "t-1",
             tabUrl: "https://chatgpt.com/c/deep",
+            assistantTurn: {
+              messageId: "message-stale",
+              turnIndex: 1,
+              modelSlug: "gpt-4o",
+              responseSha256: "f".repeat(64),
+              capturedAt: "2026-07-14T00:00:00.000Z",
+            },
           },
+          warnings: [
+            {
+              code: "browser-deep-research-provenance-incomplete",
+              severity: "warning",
+              message: "Stale provenance warning.",
+            },
+            {
+              code: "browser-deep-research-citations-incomplete",
+              severity: "warning",
+              message: "Stale citation warning.",
+            },
+            {
+              code: "browser-pro-fast-large-run",
+              severity: "warning",
+              message: "Unrelated warning must survive.",
+            },
+          ],
         },
         response: { status: "completed" },
       });
@@ -244,6 +297,24 @@ describe("browser reattach end-to-end (simulated)", () => {
       const log = await sessionStore.readLog(sessionMeta.id);
       expect(updated?.status).toBe("completed");
       expect(updated?.response?.status).toBe("completed");
+      expect(updated?.browser?.runtime?.assistantTurn).toMatchObject({
+        messageId: "message-fresh",
+        turnIndex: 3,
+        modelSlug: "gpt-5-5-instant",
+        responseSha256: createHash("sha256").update(recoveredReport).digest("hex"),
+      });
+      expect(updated?.browser?.citationStatus).toEqual({
+        total: 2,
+        linked: 1,
+        missingIndexes: [2],
+      });
+      expect(updated?.browser?.warnings).toEqual([
+        expect.objectContaining({ code: "browser-pro-fast-large-run" }),
+        expect.objectContaining({
+          code: "browser-deep-research-citations-incomplete",
+          details: { total: 2, linked: 1, missingIndexes: [2] },
+        }),
+      ]);
       expect(resumeMock).toHaveBeenCalledTimes(1);
       expect(log).toContain("Recovered report body");
       expect(log).not.toContain("Called tool");
@@ -261,9 +332,23 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
+      const recoveredReport = "# Deep report\n\nRecovered report body.";
       resumeMock.mockResolvedValue({
-        answerText: "# Deep report\n\nRecovered report body.",
-        answerMarkdown: "# Deep report\n\nRecovered report body.",
+        answerText: recoveredReport,
+        answerMarkdown: recoveredReport,
+        assistantTurn: {
+          messageId: "message-project",
+          finalMessageId: "message-project-final",
+          turnIndex: 2,
+          modelSlug: "gpt-5-5-instant",
+          resolvedModelSlug: "gpt-5-5-instant",
+          defaultModelSlug: "gpt-5-6-pro",
+          deepResearchVersion: "standard",
+          metadataSource: "chatgpt-conversation-record",
+          responseSha256: createHash("sha256").update(recoveredReport).digest("hex"),
+          capturedAt: "2026-07-15T00:00:00.000Z",
+        },
+        citationStatus: { total: 0, linked: 0, missingIndexes: [] },
       });
 
       const { sessionStore } = await import("../../src/sessionStore.js");
@@ -301,6 +386,14 @@ describe("browser reattach end-to-end (simulated)", () => {
       logSpy.mockRestore();
 
       expect(resumeMock).toHaveBeenCalledTimes(1);
+      const updated = await sessionStore.readSession(sessionMeta.id);
+      expect(updated?.status).toBe("completed");
+      expect(updated?.browser?.warnings).toEqual([
+        expect.objectContaining({
+          code: "browser-deep-research-provenance-incomplete",
+          details: expect.objectContaining({ missingFields: ["modelSelection"] }),
+        }),
+      ]);
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);

@@ -13,12 +13,21 @@ import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import { assembleBrowserPrompt } from "./prompt.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
-import type { BrowserArchiveResult, BrowserLogger } from "./types.js";
+import type {
+  BrowserArchiveResult,
+  BrowserDeepResearchCitationStatus,
+  BrowserLogger,
+} from "./types.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
   saveDeepResearchReportArtifact,
 } from "./artifacts.js";
+import {
+  addDeepResearchPickerEvidenceWarning,
+  replaceDeepResearchEvidenceWarnings,
+  revalidateDeepResearchAnswerFields,
+} from "./deepResearchAnswer.js";
 
 export interface BrowserExecutionResult {
   usage: {
@@ -31,6 +40,7 @@ export interface BrowserExecutionResult {
   runtime: BrowserRuntimeMetadata;
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  citationStatus?: BrowserDeepResearchCitationStatus;
   warnings?: BrowserRunWarning[];
   answerText: string;
   artifacts?: SessionArtifact[];
@@ -242,22 +252,51 @@ export async function runBrowserSessionExecution(
   if (modelSelection) {
     log(formatModelSelectionEvidence(modelSelection));
   }
-  const warnings = buildBrowserRunWarnings({
-    runOptions,
-    browserConfig,
-    inputTokens: promptArtifacts.estimatedInputTokens,
-    elapsedMs: browserResult.tookMs,
-    modelSelection,
-  });
+  const clientDeepResearchFields =
+    browserConfig.researchMode === "deep"
+      ? revalidateDeepResearchAnswerFields({
+          answerText: browserResult.answerText,
+          answerMarkdown: browserResult.answerMarkdown || browserResult.answerText || "",
+          answerHtml: browserResult.answerHtml,
+          assistantTurn: browserResult.assistantTurn,
+          citationStatus: browserResult.citationStatus,
+        })
+      : undefined;
+  const clientDeepResearchEvidenceWarnings = clientDeepResearchFields
+    ? addDeepResearchPickerEvidenceWarning(clientDeepResearchFields.warnings ?? [], modelSelection)
+    : [];
+  const answerText =
+    clientDeepResearchFields?.answerMarkdown ??
+    (browserResult.answerMarkdown || browserResult.answerText || "");
+  const browserWarnings =
+    browserConfig.researchMode === "deep"
+      ? (replaceDeepResearchEvidenceWarnings(
+          browserResult.warnings,
+          clientDeepResearchEvidenceWarnings,
+        ) ?? [])
+      : (browserResult.warnings ?? []);
+  const warnings = Array.from(
+    new Map(
+      [
+        ...browserWarnings,
+        ...buildBrowserRunWarnings({
+          runOptions,
+          browserConfig,
+          inputTokens: promptArtifacts.estimatedInputTokens,
+          elapsedMs: browserResult.tookMs,
+          modelSelection,
+        }),
+      ].map((warning) => [`${warning.code}:${warning.message}`, warning]),
+    ).values(),
+  );
   for (const warning of warnings) {
     log(chalk.yellow(`[browser] ${warning.message}`));
   }
   if (!runOptions.silent) {
     log(chalk.bold("Answer:"));
-    log(browserResult.answerMarkdown || browserResult.answerText || chalk.dim("(no text output)"));
+    log(answerText || chalk.dim("(no text output)"));
     log("");
   }
-  const answerText = browserResult.answerMarkdown || browserResult.answerText || "";
   const savedArtifacts = await ensureSessionArtifacts({
     sessionId: runOptions.sessionId,
     prompt: promptArtifacts.composerText,
@@ -313,11 +352,17 @@ export async function runBrowserSessionExecution(
       tabUrl: browserResult.tabUrl,
       conversationId: browserResult.conversationId,
       promptSubmitted: browserResult.promptSubmitted,
+      submittedUserMessageId: browserResult.submittedUserMessageId,
+      submittedUserTurnIndex: browserResult.submittedUserTurnIndex,
       controllerPid: browserResult.controllerPid ?? process.pid,
       assistantTurn: browserResult.assistantTurn,
     },
     archive: browserResult.archive,
     modelSelection,
+    citationStatus:
+      browserConfig.researchMode === "deep"
+        ? clientDeepResearchFields?.citationStatus
+        : browserResult.citationStatus,
     warnings,
     answerText,
     artifacts: savedArtifacts,

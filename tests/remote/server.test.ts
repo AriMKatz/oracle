@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
-import { createRemoteServer } from "../../src/remote/server.js";
+import { __test__ as serverTest, createRemoteServer } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { RemoteArtifactDescriptor } from "../../src/remote/types.js";
@@ -27,6 +27,132 @@ const CAN_LISTEN_LOCALHOST =
   ).status === 0;
 
 describe("remote browser service", () => {
+  test("rebuilds returned evidence from explicit scalar allowlists", () => {
+    const result = serverTest.sanitizeResult({
+      answerText: "deep report",
+      answerMarkdown: "deep report",
+      modelSelection: {
+        requestedModel: "Pro",
+        resolvedLabel: "Pro",
+        strategy: "select",
+        status: "switched",
+        verified: true,
+        source: "chatgpt-model-picker",
+        capturedAt: "2026-07-15T00:00:00.000Z",
+        hostProfilePath: "/host/private/Profile 1",
+      } as BrowserRunResult["modelSelection"] & { hostProfilePath: string },
+      assistantTurn: {
+        messageId: "message-remote",
+        finalMessageId: "message-remote-final",
+        turnId: "conversation-turn-2",
+        turnIndex: 1,
+        modelSlug: "gpt-5-5-instant",
+        resolvedModelSlug: "gpt-5-5-instant",
+        defaultModelSlug: "gpt-5-6-pro",
+        deepResearchVersion: "standard",
+        metadataSource: "chatgpt-conversation-record",
+        responseSha256: "d".repeat(64),
+        capturedAt: "2026-07-15T00:00:01.000Z",
+        rawConversationRecord: { accessToken: "host-secret" },
+      } as BrowserRunResult["assistantTurn"] & {
+        rawConversationRecord: { accessToken: string };
+      },
+      citationStatus: {
+        total: 2,
+        linked: 1,
+        missingIndexes: [2],
+        rawCitationMap: { 2: "host-secret-citation-url" },
+      } as BrowserRunResult["citationStatus"] & {
+        rawCitationMap: Record<number, string>;
+      },
+      archive: {
+        mode: "always",
+        attempted: true,
+        archived: true,
+        conversationUrl: "https://chatgpt.com/c/remote-conversation",
+        error: "host-secret-archive-error",
+        rawArchiveReceipt: "host-secret-archive-receipt",
+      } as BrowserRunResult["archive"] & { rawArchiveReceipt: string },
+      tookMs: 1000,
+      answerTokens: 42,
+      answerChars: 11,
+    });
+
+    expect(result.modelSelection).toEqual({
+      requestedModel: "Pro",
+      resolvedLabel: "Pro",
+      strategy: "select",
+      status: "switched",
+      verified: true,
+      source: "chatgpt-model-picker",
+      capturedAt: "2026-07-15T00:00:00.000Z",
+    });
+    expect(result.assistantTurn).toEqual({
+      messageId: "message-remote",
+      finalMessageId: "message-remote-final",
+      turnId: "conversation-turn-2",
+      turnIndex: 1,
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record",
+      responseSha256: "d".repeat(64),
+      capturedAt: "2026-07-15T00:00:01.000Z",
+    });
+    expect(result.citationStatus).toEqual({ total: 2, linked: 1, missingIndexes: [2] });
+    expect(result.archive).toEqual({
+      mode: "always",
+      attempted: true,
+      archived: true,
+      conversationUrl: "https://chatgpt.com/c/remote-conversation",
+    });
+    expect(JSON.stringify(result)).not.toContain("hostProfilePath");
+    expect(JSON.stringify(result)).not.toContain("/host/private/Profile 1");
+    expect(JSON.stringify(result)).not.toContain("rawConversationRecord");
+    expect(JSON.stringify(result)).not.toContain("host-secret");
+    expect(JSON.stringify(result)).not.toContain("rawCitationMap");
+    expect(JSON.stringify(result)).not.toContain("host-secret-citation-url");
+    expect(JSON.stringify(result)).not.toContain("rawArchiveReceipt");
+    expect(JSON.stringify(result)).not.toContain("host-secret-archive-receipt");
+    expect(JSON.stringify(result)).not.toContain("host-secret-archive-error");
+  });
+
+  test("drops malformed remote citation status", () => {
+    const result = serverTest.sanitizeResult({
+      answerText: "deep report",
+      answerMarkdown: "deep report",
+      citationStatus: {
+        total: 1,
+        linked: 1,
+        missingIndexes: [2],
+      },
+      tookMs: 1000,
+      answerTokens: 42,
+      answerChars: 11,
+    });
+
+    expect(result.citationStatus).toBeUndefined();
+  });
+
+  test("drops malformed remote archive metadata", () => {
+    const result = serverTest.sanitizeResult({
+      answerText: "answer",
+      answerMarkdown: "answer",
+      archive: {
+        mode: "always",
+        attempted: "yes",
+        archived: true,
+        conversationUrl: "file:///host/private/archive-receipt",
+      } as unknown as BrowserRunResult["archive"],
+      tookMs: 1000,
+      answerTokens: 42,
+      answerChars: 6,
+    });
+
+    expect(result.archive).toBeUndefined();
+  });
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "streams logs and returns results via client executor",
     async () => {
@@ -63,6 +189,56 @@ describe("remote browser service", () => {
             const result: BrowserRunResult = {
               answerText: "hi",
               answerMarkdown: "hi",
+              modelSelection: {
+                requestedModel: "Pro",
+                resolvedLabel: "Pro",
+                strategy: "select",
+                status: "switched",
+                verified: true,
+                source: "chatgpt-model-picker",
+                capturedAt: "2026-07-15T00:00:00.000Z",
+                hostProfilePath: "/host/private/Profile 1",
+              } as BrowserRunResult["modelSelection"] & { hostProfilePath: string },
+              assistantTurn: {
+                messageId: "message-remote",
+                finalMessageId: "message-remote-final",
+                turnId: "conversation-turn-2",
+                turnIndex: 1,
+                modelSlug: "gpt-5-5-instant",
+                resolvedModelSlug: "gpt-5-5-instant",
+                defaultModelSlug: "gpt-5-6-pro",
+                deepResearchVersion: "standard",
+                metadataSource: "chatgpt-conversation-record",
+                responseSha256: "d".repeat(64),
+                capturedAt: "2026-07-15T00:00:01.000Z",
+                rawConversationRecord: {
+                  accessToken: "host-secret",
+                  internal: "host-only conversation metadata",
+                },
+              } as BrowserRunResult["assistantTurn"] & {
+                rawConversationRecord: { accessToken: string; internal: string };
+              },
+              citationStatus: {
+                total: 2,
+                linked: 1,
+                missingIndexes: [2],
+                rawCitationMap: { 2: "host-secret-citation-url" },
+              } as BrowserRunResult["citationStatus"] & {
+                rawCitationMap: Record<number, string>;
+              },
+              warnings: [
+                {
+                  code: "browser-deep-research-citations-incomplete",
+                  severity: "warning",
+                  message: "host-only detail must be replaced",
+                  details: { secret: "do not cross the bridge" },
+                },
+                {
+                  code: "host-private-warning",
+                  severity: "warning",
+                  message: "must be stripped",
+                },
+              ],
               tookMs: 1000,
               answerTokens: 42,
               answerChars: 2,
@@ -96,6 +272,40 @@ describe("remote browser service", () => {
 
       expect(clientLogs.some((entry) => entry.includes("uploading attachment"))).toBe(true);
       expect(result.answerText).toBe("hi");
+      expect(result.modelSelection).toEqual({
+        requestedModel: "Pro",
+        resolvedLabel: "Pro",
+        strategy: "select",
+        status: "switched",
+        verified: true,
+        source: "chatgpt-model-picker",
+        capturedAt: "2026-07-15T00:00:00.000Z",
+      });
+      expect(result.assistantTurn).toEqual({
+        messageId: "message-remote",
+        finalMessageId: "message-remote-final",
+        turnId: "conversation-turn-2",
+        turnIndex: 1,
+        modelSlug: "gpt-5-5-instant",
+        resolvedModelSlug: "gpt-5-5-instant",
+        defaultModelSlug: "gpt-5-6-pro",
+        deepResearchVersion: "standard",
+        metadataSource: "chatgpt-conversation-record",
+        responseSha256: "d".repeat(64),
+        capturedAt: "2026-07-15T00:00:01.000Z",
+      });
+      expect(result.citationStatus).toEqual({ total: 2, linked: 1, missingIndexes: [2] });
+      expect(JSON.stringify(result)).not.toContain("hostProfilePath");
+      expect(JSON.stringify(result)).not.toContain("/host/private/Profile 1");
+      expect(JSON.stringify(result)).not.toContain("rawConversationRecord");
+      expect(JSON.stringify(result)).not.toContain("host-secret");
+      expect(JSON.stringify(result)).not.toContain("rawCitationMap");
+      expect(JSON.stringify(result)).not.toContain("host-secret-citation-url");
+      expect(result.warnings).toEqual([
+        expect.objectContaining({ code: "browser-deep-research-citations-incomplete" }),
+      ]);
+      expect(JSON.stringify(result.warnings)).not.toContain("do not cross the bridge");
+      expect(JSON.stringify(result.warnings)).not.toContain("host-private-warning");
       expect(runLog).toEqual(["remote"]);
 
       const healthUnauthorized = await httpGetJson({

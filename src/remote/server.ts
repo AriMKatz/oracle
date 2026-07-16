@@ -8,7 +8,13 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import chalk from "chalk";
-import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
+import type {
+  BrowserAttachment,
+  BrowserArchiveResult,
+  BrowserDeepResearchCitationStatus,
+  BrowserLogger,
+  CookieParam,
+} from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type {
@@ -36,7 +42,12 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
-import type { BrowserRunWarning, SessionArtifact } from "../sessionManager.js";
+import type {
+  BrowserAssistantTurnEvidence,
+  BrowserModelSelectionEvidence,
+  BrowserRunWarning,
+  SessionArtifact,
+} from "../sessionManager.js";
 
 export interface RemoteServerOptions {
   host?: string;
@@ -705,10 +716,195 @@ function sanitizeName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+function sanitizeNullableString(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function sanitizeModelSelection(
+  evidence: BrowserModelSelectionEvidence | undefined,
+): BrowserModelSelectionEvidence | undefined {
+  if (
+    !evidence ||
+    !["already-selected", "switched", "switched-best-effort", "skipped", "unavailable"].includes(
+      evidence.status,
+    ) ||
+    typeof evidence.verified !== "boolean" ||
+    !["chatgpt-model-picker", "config"].includes(evidence.source) ||
+    typeof evidence.capturedAt !== "string"
+  ) {
+    return undefined;
+  }
+  const strategy = ["select", "current", "ignore"].includes(evidence.strategy ?? "")
+    ? evidence.strategy
+    : undefined;
+  return {
+    requestedModel: sanitizeNullableString(evidence.requestedModel),
+    resolvedLabel: sanitizeNullableString(evidence.resolvedLabel),
+    strategy,
+    status: evidence.status,
+    verified: evidence.verified,
+    source: evidence.source,
+    capturedAt: evidence.capturedAt,
+  };
+}
+
+function sanitizeAssistantTurn(
+  evidence: BrowserAssistantTurnEvidence | undefined,
+): BrowserAssistantTurnEvidence | undefined {
+  if (
+    !evidence ||
+    typeof evidence.responseSha256 !== "string" ||
+    typeof evidence.capturedAt !== "string"
+  ) {
+    return undefined;
+  }
+  const turnIndex =
+    evidence.turnIndex === null
+      ? null
+      : Number.isSafeInteger(evidence.turnIndex) && (evidence.turnIndex as number) >= 0
+        ? evidence.turnIndex
+        : undefined;
+  return {
+    messageId: sanitizeNullableString(evidence.messageId),
+    finalMessageId: sanitizeNullableString(evidence.finalMessageId),
+    turnId: sanitizeNullableString(evidence.turnId),
+    turnIndex,
+    modelSlug: sanitizeNullableString(evidence.modelSlug),
+    resolvedModelSlug: sanitizeNullableString(evidence.resolvedModelSlug),
+    defaultModelSlug: sanitizeNullableString(evidence.defaultModelSlug),
+    deepResearchVersion: sanitizeNullableString(evidence.deepResearchVersion),
+    metadataSource:
+      evidence.metadataSource === "chatgpt-conversation-record"
+        ? evidence.metadataSource
+        : undefined,
+    responseSha256: evidence.responseSha256,
+    capturedAt: evidence.capturedAt,
+  };
+}
+
+function sanitizeCitationStatus(value: unknown): BrowserDeepResearchCitationStatus | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    !Number.isSafeInteger(raw.total) ||
+    (raw.total as number) < 0 ||
+    (raw.total as number) > 999 ||
+    !Number.isSafeInteger(raw.linked) ||
+    (raw.linked as number) < 0 ||
+    (raw.linked as number) > (raw.total as number) ||
+    !Array.isArray(raw.missingIndexes)
+  ) {
+    return undefined;
+  }
+  const missingIndexes = raw.missingIndexes;
+  if (
+    !missingIndexes.every(
+      (index): index is number =>
+        typeof index === "number" && Number.isSafeInteger(index) && index >= 1 && index <= 999,
+    ) ||
+    new Set(missingIndexes).size !== missingIndexes.length ||
+    (raw.linked as number) + missingIndexes.length !== (raw.total as number)
+  ) {
+    return undefined;
+  }
+  return {
+    total: raw.total as number,
+    linked: raw.linked as number,
+    missingIndexes: [...missingIndexes],
+  };
+}
+
+function sanitizeArchiveResult(value: unknown): BrowserArchiveResult | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    !["auto", "always", "never"].includes(String(raw.mode ?? "")) ||
+    typeof raw.attempted !== "boolean" ||
+    typeof raw.archived !== "boolean"
+  ) {
+    return undefined;
+  }
+  const mode = raw.mode as BrowserArchiveResult["mode"];
+  const allowedReasons = new Set([
+    "disabled",
+    "missing-conversation-url",
+    "temporary-chat",
+    "project-conversation",
+    "deep-research",
+    "multi-turn",
+    "artifact-save-failed",
+    "missing-conversation-id",
+    "conversation-changed",
+    "conversation-menu-not-found",
+    "archive-menu-item-not-found",
+    "archive-not-confirmed",
+    "archive-failed",
+  ]);
+  const reasonCandidate = typeof raw.reason === "string" ? raw.reason.trim() : "";
+  const reason = allowedReasons.has(reasonCandidate) ? reasonCandidate : undefined;
+  let conversationUrl: string | undefined;
+  if (typeof raw.conversationUrl === "string") {
+    try {
+      const parsed = new URL(raw.conversationUrl);
+      const hostname = parsed.hostname.toLowerCase();
+      if (
+        parsed.protocol === "https:" &&
+        (hostname === "chatgpt.com" || hostname === "chat.openai.com") &&
+        /\/c\/[^/?#]+/.test(parsed.pathname)
+      ) {
+        conversationUrl = parsed.href;
+      }
+    } catch {
+      // Omit malformed or non-ChatGPT URLs from the remote response.
+    }
+  }
+  return {
+    mode,
+    attempted: raw.attempted,
+    archived: raw.archived,
+    ...(reason ? { reason } : {}),
+    ...(conversationUrl ? { conversationUrl } : {}),
+  };
+}
+
 function sanitizeResult(
   result: BrowserRunResult,
   warnings: BrowserRunWarning[] = [],
 ): BrowserRunResult {
+  const safeResultWarnings: BrowserRunWarning[] = (result.warnings ?? []).flatMap((warning) => {
+    if (warning.code === "browser-deep-research-provenance-incomplete") {
+      return [
+        {
+          code: "browser-deep-research-provenance-incomplete",
+          severity: "warning" as const,
+          message:
+            "Deep Research report captured, but exact report-owner, selected/default-model, owner-model, report-hash, or picker provenance is incomplete or inconsistent; do not claim a fully verified Deep Research response.",
+        },
+      ];
+    }
+    if (warning.code === "browser-deep-research-citations-incomplete") {
+      return [
+        {
+          code: "browser-deep-research-citations-incomplete",
+          severity: "warning" as const,
+          message:
+            "Deep Research report captured, but complete interactive citation-destination evidence is unavailable; unresolved citation numbers were preserved without guessed links.",
+        },
+      ];
+    }
+    return [];
+  });
+  const sanitizedWarnings = Array.from(
+    new Map(
+      [...safeResultWarnings, ...warnings].map((warning) => [
+        `${warning.code}:${warning.message}`,
+        warning,
+      ]),
+    ).values(),
+  );
   return {
     answerText: result.answerText,
     answerMarkdown: result.answerMarkdown,
@@ -716,7 +912,11 @@ function sanitizeResult(
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
-    warnings: warnings.length > 0 ? warnings : undefined,
+    modelSelection: sanitizeModelSelection(result.modelSelection),
+    assistantTurn: sanitizeAssistantTurn(result.assistantTurn),
+    archive: sanitizeArchiveResult(result.archive),
+    citationStatus: sanitizeCitationStatus(result.citationStatus),
+    warnings: sanitizedWarnings.length > 0 ? sanitizedWarnings : undefined,
     chromePid: undefined,
     chromePort: undefined,
     userDataDir: undefined,
@@ -983,3 +1183,7 @@ async function launchManualLoginChrome(
     );
   }
 }
+
+export const __test__ = {
+  sanitizeResult,
+};

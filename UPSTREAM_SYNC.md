@@ -63,10 +63,37 @@ The fork owns the local execution contract:
 - browser mode is the documented installed-skill path;
 - Stable Chrome uses an explicit copied `Profile 1` by default;
 - `gpt-5-pro` selects the visible Pro target;
-- the exact returned assistant turn must report `gpt-5-6-pro`;
+- a normal returned assistant turn must expose the exact
+  `data-message-model-slug="gpt-5-6-pro"` value on that DOM turn;
+- a Deep Research report must bind to its exact outer owner turn, preserve the
+  exact owner/orchestration `model_slug` and resolved slug, and keep both
+  separate from picker evidence and the exact selected/default
+  `gpt-5-6-pro`; the owner or resolved slug may name a different model, and no
+  recorded field may be assigned a model role other than the one ChatGPT
+  recorded;
+- a Deep Research run must freeze the first post-submission conversation ID
+  and persist the exact authenticated conversation-record user message ID and
+  pre-submit DOM turn-boundary index; completion and reattach must require that
+  exact conversation/user chain rather than reconstruct identity from prompt
+  text;
+- the Deep Research terminal message ID must be preserved; it may equal the
+  outer owner ID when the owner is itself terminal, or identify the later
+  terminal assistant message on the same active branch;
+- each detected interactive Deep Research citation index must be linked only
+  when its source metadata identifies one unambiguous, exact index-matched
+  primary HTTP(S) URL; missing or contradictory destinations remain unlinked
+  and produce a warning rather than a guessed URL, while zero detected numbered
+  citations is valid only with affirmative zero-citation UI evidence; an empty
+  selector scan alone is incomplete because it may reflect UI-schema drift;
+  normalized citation completeness counts must be persisted so cross-version
+  consumers fail closed when positive evidence is unavailable;
 - returned-turn identity, index, and response hash are persisted;
 - the saved transcript is the post-run answer source;
-- authentication and model-evidence failures stop the run;
+- browser authentication, picker-selection, and normal-response exact DOM
+  model-evidence failures stop the run;
+- after a complete Deep Research report is captured, incomplete
+  conversation-record provenance or citation binding preserves the report and
+  records a warning, but the session must not be represented as fully verified;
 - no silent model, engine, manual-login, or private-profile fallback is used;
 - no Keychain mutation, mandatory preliminary request, or hidden machine
   configuration is required;
@@ -173,7 +200,9 @@ surface are presumptively desirable. Relevant surfaces include:
 - cookie or Keychain authentication detection;
 - stale or foreign DevTools-port detection;
 - logged-out fail-fast behavior;
-- Pro selection and exact returned-model evidence;
+- Pro selection and response-appropriate model evidence (exact returned DOM
+  slug for normal responses; separate picker, selected/default,
+  owner/orchestration, and resolved evidence for Deep Research);
 - final-turn identity and saved-transcript correctness;
 - temporary-profile cleanup.
 
@@ -196,7 +225,10 @@ Adapt an upstream change when its useful part can be preserved but its direct
 application would weaken the local contract. Typical examples include:
 
 - a new profile-selection implementation that would reintroduce ambiguity;
-- model-selection changes that do not prove the returned GPT-5.6 Pro turn;
+- model-selection changes that do not preserve response-appropriate exact
+  evidence: returned-DOM `gpt-5-6-pro` for a normal response, or separate
+  verified picker, selected/default, owner/orchestration, and resolved fields
+  for Deep Research;
 - recovery changes that assume a deleted throwaway profile can be reattached;
 - defaults that silently select API mode or another model;
 - changes that combine copied-profile mode with incompatible browser options.
@@ -212,9 +244,11 @@ Reject an upstream effect—or omit that part of a mixed change—when it would:
 - add a generic prompt wrapper or forced review style;
 - make profile or browser identity ambiguous;
 - add silent model, engine, authentication, or transport fallback;
-- accept a picker label without exact returned-turn evidence;
+- accept a picker label without the response-appropriate exact model evidence;
 - discard final-turn identity, response hash, or saved-answer evidence;
-- continue after authentication or evidence verification fails;
+- continue after browser authentication, picker-selection, or normal-response
+  exact DOM evidence verification fails, or represent a warning-bearing Deep
+  Research capture as fully verified;
 - require invasive Keychain changes or hidden machine-only state;
 - remove compatible optional controls only because they are not the default;
 - remove or weaken the installed skill's standing informed external-upload
@@ -308,8 +342,20 @@ test that proves:
 
 - copied Stable Chrome `Profile 1` authentication;
 - verified Pro selection;
-- exact returned model `gpt-5-6-pro`;
+- for a normal response, exact returned DOM model `gpt-5-6-pro`; or, for Deep
+  Research, separately verified Pro picker selection, exact selected/default
+  `gpt-5-6-pro`, and exact owner/orchestration and resolved slugs without
+  requiring the latter two slugs to equal Pro;
 - final-turn identity and response hash;
+- for Deep Research, a terminal assistant message ID (equal to the report
+  owner when it is terminal, otherwise the later terminal message), every
+  detected numbered citation exactly resolved, no incomplete-provenance or
+  incomplete-citation warning; prompts that request citations must produce a
+  positive citation total, while an explicit zero-citation UI state is allowed
+  only for genuinely citation-free or attachment-based reports;
+- for Deep Research, a persisted pinned conversation ID/URL plus the exact
+  submitted authenticated user message ID and turn index, with the report
+  owner proven to descend from that user on the active conversation branch;
 - answer recovery from the saved transcript;
 - no fallback;
 - cleanup of the disposable browser profile.

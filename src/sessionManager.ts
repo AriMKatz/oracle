@@ -87,9 +87,24 @@ export interface BrowserSessionConfig {
 /** Evidence captured from the exact assistant turn Oracle returned to the caller. */
 export interface BrowserAssistantTurnEvidence {
   messageId?: string | null;
+  /** Terminal assistant message for a tool-backed response; may equal messageId. */
+  finalMessageId?: string | null;
   turnId?: string | null;
   turnIndex?: number | null;
+  /**
+   * Exact returned-turn model slug. For Deep Research this is the report
+   * owner/orchestration message's conversation-record model_slug and may be
+   * different from the separately recorded selected/default model.
+   */
   modelSlug?: string | null;
+  /** Exact resolved model slug recorded for a ChatGPT Deep Research message. */
+  resolvedModelSlug?: string | null;
+  /** Exact default model slug recorded for a ChatGPT Deep Research message. */
+  defaultModelSlug?: string | null;
+  /** Exact Deep Research capability version recorded on the preceding user message. */
+  deepResearchVersion?: string | null;
+  /** Where the additional tool-backed turn metadata was read. */
+  metadataSource?: "chatgpt-conversation-record";
   /** SHA-256 of the returned turn's Markdown after trimming. */
   responseSha256: string;
   capturedAt: string;
@@ -108,6 +123,10 @@ export interface BrowserRuntimeMetadata {
   conversationId?: string;
   /** True after Oracle has submitted the prompt to ChatGPT. */
   promptSubmitted?: boolean;
+  /** Exact authenticated ChatGPT record ID for the user turn submitted by Oracle. */
+  submittedUserMessageId?: string;
+  /** DOM conversation-turn position of the exact user turn submitted by Oracle. */
+  submittedUserTurnIndex?: number;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
   controllerPid?: number;
   /** Identity, model slug, and content hash for the returned assistant turn. */
@@ -154,12 +173,20 @@ export interface BrowserRunWarning {
   details?: Record<string, unknown>;
 }
 
+/** Positive completeness evidence for interactive Deep Research citations. */
+export interface BrowserDeepResearchCitationStatus {
+  total: number;
+  linked: number;
+  missingIndexes: number[];
+}
+
 export interface BrowserMetadata {
   config?: BrowserSessionConfig;
   runtime?: BrowserRuntimeMetadata;
   harvest?: BrowserHarvestMetadata;
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  citationStatus?: BrowserDeepResearchCitationStatus;
   warnings?: BrowserRunWarning[];
 }
 

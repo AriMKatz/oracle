@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { createHash } from "node:crypto";
 import type { RunOracleOptions } from "../../src/oracle.js";
 import type { BrowserSessionConfig } from "../../src/sessionStore.js";
 import {
@@ -14,6 +15,33 @@ const baseRunOptions: RunOracleOptions = {
 };
 
 const baseConfig: BrowserSessionConfig = {};
+const deepReport = "deep report";
+const verifiedDeepResearchModelSelection = {
+  requestedModel: "Pro",
+  resolvedLabel: "Pro",
+  strategy: "select" as const,
+  status: "switched" as const,
+  verified: true,
+  source: "chatgpt-model-picker" as const,
+  capturedAt: "2026-07-13T00:00:00.000Z",
+};
+const completeCitationStatus = { total: 0, linked: 0, missingIndexes: [] };
+
+function buildCompleteDeepResearchAssistantTurn() {
+  return {
+    messageId: "message-1",
+    finalMessageId: "message-final",
+    turnId: "conversation-turn-2",
+    turnIndex: 1,
+    modelSlug: "gpt-5-5-instant",
+    resolvedModelSlug: "gpt-5-5-instant",
+    defaultModelSlug: "gpt-5-6-pro",
+    deepResearchVersion: "standard",
+    metadataSource: "chatgpt-conversation-record" as const,
+    responseSha256: createHash("sha256").update(deepReport).digest("hex"),
+    capturedAt: "2026-07-13T00:00:00.000Z",
+  };
+}
 
 describe("runBrowserSessionExecution", () => {
   test("logs stats and returns usage/runtime", async () => {
@@ -46,6 +74,8 @@ describe("runBrowserSessionExecution", () => {
         answerTokens: 12,
         answerChars: 20,
         conversationId: "foo",
+        submittedUserMessageId: "user-message-1",
+        submittedUserTurnIndex: 1,
         assistantTurn: {
           messageId: "message-1",
           turnId: "conversation-turn-2",
@@ -54,6 +84,13 @@ describe("runBrowserSessionExecution", () => {
           responseSha256: "a".repeat(64),
           capturedAt: "2026-07-13T00:00:00.000Z",
         },
+        warnings: [
+          {
+            code: "browser-deep-research-provenance-incomplete",
+            severity: "warning" as const,
+            message: "Deep Research provenance incomplete",
+          },
+        ],
       };
     });
     const result = await runBrowserSessionExecution(
@@ -88,6 +125,8 @@ describe("runBrowserSessionExecution", () => {
     expect(result.runtime).toMatchObject({
       chromePid: undefined,
       conversationId: "foo",
+      submittedUserMessageId: "user-message-1",
+      submittedUserTurnIndex: 1,
       assistantTurn: {
         messageId: "message-1",
         modelSlug: "gpt-5-6-pro",
@@ -95,6 +134,9 @@ describe("runBrowserSessionExecution", () => {
       },
     });
     expect(result.artifacts).toEqual([{ kind: "transcript", path: "/tmp/transcript.md" }]);
+    expect(result.warnings).toEqual([
+      expect.objectContaining({ code: "browser-deep-research-provenance-incomplete" }),
+    ]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
       expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
@@ -144,6 +186,275 @@ describe("runBrowserSessionExecution", () => {
         }),
       }),
     );
+  });
+
+  test("fails closed when an older remote bridge omits Deep Research evidence and warnings", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "deep" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: deepReport,
+          answerMarkdown: deepReport,
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 11,
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "browser-deep-research-provenance-incomplete",
+          details: expect.objectContaining({
+            missingFields: expect.arrayContaining(["assistantTurn", "modelSelection"]),
+          }),
+        }),
+        expect.objectContaining({ code: "browser-deep-research-citations-incomplete" }),
+      ]),
+    );
+  });
+
+  test("fails closed when a remote bridge returns only legacy Deep Research evidence", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "deep" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: deepReport,
+          answerMarkdown: deepReport,
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 11,
+          assistantTurn: {
+            messageId: "message-1",
+            turnId: "conversation-turn-2",
+            turnIndex: 1,
+            modelSlug: "gpt-5-6-pro",
+            responseSha256: createHash("sha256").update(deepReport).digest("hex"),
+            capturedAt: "2026-07-13T00:00:00.000Z",
+          },
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          code: "browser-deep-research-provenance-incomplete",
+          details: expect.objectContaining({
+            missingFields: expect.arrayContaining([
+              "finalMessageId",
+              "resolvedModelSlug",
+              "defaultModelSlug",
+              "deepResearchVersion",
+              "metadataSource",
+              "modelSelection",
+            ]),
+          }),
+        }),
+        expect.objectContaining({ code: "browser-deep-research-citations-incomplete" }),
+      ]),
+    );
+  });
+
+  test("accepts complete current Deep Research evidence from a remote bridge", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "deep" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: deepReport,
+          answerMarkdown: deepReport,
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 11,
+          modelSelection: verifiedDeepResearchModelSelection,
+          assistantTurn: buildCompleteDeepResearchAssistantTurn(),
+          citationStatus: completeCitationStatus,
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual([]);
+    expect(result.citationStatus).toEqual(completeCitationStatus);
+  });
+
+  test("fails closed when an older remote bridge omits only Deep Research citation status", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "deep" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: deepReport,
+          answerMarkdown: deepReport,
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 11,
+          modelSelection: verifiedDeepResearchModelSelection,
+          assistantTurn: buildCompleteDeepResearchAssistantTurn(),
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-citations-incomplete",
+        details: { citationStatus: "missing-or-invalid" },
+      }),
+    ]);
+  });
+
+  test("fails closed when Deep Research picker evidence is not verified", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "deep" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: deepReport,
+          answerMarkdown: deepReport,
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 11,
+          modelSelection: {
+            ...verifiedDeepResearchModelSelection,
+            requestedModel: "gpt-5.2-pro",
+            resolvedLabel: "Auto",
+            strategy: "current" as const,
+            status: "unavailable" as const,
+            verified: false,
+            source: "config" as const,
+          },
+          assistantTurn: buildCompleteDeepResearchAssistantTurn(),
+          citationStatus: completeCitationStatus,
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual([
+      expect.objectContaining({
+        code: "browser-deep-research-provenance-incomplete",
+        details: expect.objectContaining({
+          mismatchedFields: expect.arrayContaining([
+            "modelSelection.requestedModel",
+            "modelSelection.resolvedLabel",
+            "modelSelection.verified",
+            "modelSelection.source",
+            "modelSelection.strategy",
+            "modelSelection.status",
+          ]),
+        }),
+      }),
+    ]);
+  });
+
+  test("does not require Deep Research provenance for ordinary browser runs", async () => {
+    const result = await runBrowserSessionExecution(
+      {
+        runOptions: baseRunOptions,
+        browserConfig: { researchMode: "off" },
+        cwd: "/repo",
+        log: vi.fn(),
+      },
+      {
+        assemblePrompt: async () => ({
+          markdown: "prompt",
+          composerText: "prompt",
+          estimatedInputTokens: 42,
+          attachments: [],
+          inlineFileCount: 0,
+          tokenEstimateIncludesInlineFiles: false,
+          attachmentsPolicy: "auto",
+          attachmentMode: "inline",
+          fallback: null,
+        }),
+        executeBrowser: vi.fn(async () => ({
+          answerText: "ordinary answer",
+          answerMarkdown: "ordinary answer",
+          tookMs: 1000,
+          answerTokens: 12,
+          answerChars: 15,
+        })),
+      },
+    );
+
+    expect(result.warnings).toEqual([]);
   });
 
   test("logs and returns browser model selection evidence", async () => {

@@ -47,6 +47,11 @@ import { sanitizeOscProgress } from "./oscUtils.js";
 import { readFiles } from "../oracle/files.js";
 import { cwd as getCwd } from "node:process";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import {
+  addDeepResearchPickerEvidenceWarning,
+  replaceDeepResearchEvidenceWarnings,
+  revalidateDeepResearchAnswerFields,
+} from "../browser/deepResearchAnswer.js";
 import { hasRecoverableChatGptConversation } from "../browser/reattachability.js";
 import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
@@ -89,7 +94,7 @@ export async function performSessionRun({
     return muteStdout ? true : process.stdout.write(chunk);
   };
   let currentBrowser: SessionMetadata["browser"] = browserConfig
-    ? { config: browserConfig }
+    ? { config: browserConfig, warnings: sessionMeta.browser?.warnings }
     : sessionMeta.browser;
   await sessionStore.updateSession(sessionMeta.id, {
     status: "running",
@@ -121,6 +126,7 @@ export async function performSessionRun({
             config: browserConfig,
             runtime,
             ...(modelSelection ? { modelSelection } : {}),
+            warnings: currentBrowser?.warnings,
           };
           await sessionStore.updateSession(sessionMeta.id, {
             status: "running",
@@ -158,6 +164,7 @@ export async function performSessionRun({
           runtime: result.runtime,
           archive: result.archive,
           modelSelection: result.modelSelection,
+          citationStatus: result.citationStatus,
           warnings: result.warnings,
         },
         artifacts: mergeArtifacts(sessionMeta.artifacts, result.artifacts),
@@ -516,9 +523,14 @@ export async function performSessionRun({
     const connectionLost =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "connection-lost";
-    const assistantTimeout =
-      userError?.category === "browser-automation" &&
-      (userError.details as { stage?: string } | undefined)?.stage === "assistant-timeout";
+    const browserCaptureStage =
+      userError?.category === "browser-automation"
+        ? (userError.details as { stage?: string } | undefined)?.stage
+        : undefined;
+    const incompleteBrowserCapture =
+      browserCaptureStage === "assistant-timeout" ||
+      browserCaptureStage === "assistant-recheck" ||
+      browserCaptureStage === "deep-research-timeout";
     const cloudflareChallenge =
       userError?.category === "browser-automation" &&
       (userError.details as { stage?: string } | undefined)?.stage === "cloudflare-challenge";
@@ -537,7 +549,7 @@ export async function performSessionRun({
     if (connectionLost && mode === "browser" && browserCanReattach) {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
-      const recoverableRuntime = runtime ?? currentBrowser?.runtime;
+      const recoverableRuntime = mergeBrowserRuntime(currentBrowser?.runtime, runtime);
       if (
         !hasRecoverableChatGptConversation(recoverableRuntime) &&
         recoverableRuntime?.promptSubmitted !== true
@@ -592,17 +604,24 @@ export async function performSessionRun({
         browser: {
           ...currentBrowser,
           config: browserConfig,
-          runtime: runtime ?? currentBrowser?.runtime,
+          runtime: recoverableRuntime,
         },
         response: { status: "running", incompleteReason: "chrome-disconnected" },
       });
       logBrowserReattachGuidance(recoverableRuntime);
       return;
     }
-    if (assistantTimeout && mode === "browser" && browserCanReattach) {
+    if (incompleteBrowserCapture && userError && mode === "browser" && browserCanReattach) {
       const runtime = (userError.details as { runtime?: BrowserRuntimeMetadata } | undefined)
         ?.runtime;
-      log(dim("Assistant response timed out; marking capture incomplete for reattach."));
+      const recoverableRuntime = mergeBrowserRuntime(currentBrowser?.runtime, runtime);
+      const captureLabel =
+        browserCaptureStage === "deep-research-timeout"
+          ? "Deep Research timed out"
+          : browserCaptureStage === "assistant-recheck"
+            ? "Assistant recheck did not complete"
+            : "Assistant response timed out";
+      log(dim(`${captureLabel}; marking capture incomplete for reattach.`));
       if (modelForStatus) {
         await sessionStore.updateModelRun(sessionMeta.id, modelForStatus, {
           status: "error",
@@ -623,7 +642,7 @@ export async function performSessionRun({
         browser: {
           ...currentBrowser,
           config: browserConfig,
-          runtime: runtime ?? currentBrowser?.runtime,
+          runtime: recoverableRuntime,
         },
         response: { status: "incomplete", incompleteReason: "incomplete-capture" },
         error: {
@@ -634,7 +653,7 @@ export async function performSessionRun({
       });
       const autoReattachIntervalMs = browserConfig?.autoReattachIntervalMs ?? 0;
       if (autoReattachIntervalMs > 0) {
-        const autoRuntime = runtime ?? currentBrowser?.runtime;
+        const autoRuntime = recoverableRuntime;
         const success = await autoReattachUntilComplete({
           sessionMeta,
           runtime: autoRuntime ?? undefined,
@@ -649,7 +668,7 @@ export async function performSessionRun({
           return;
         }
       }
-      logBrowserReattachGuidance(runtime ?? currentBrowser?.runtime);
+      logBrowserReattachGuidance(recoverableRuntime);
       return;
     }
     if (cloudflareChallenge && mode === "browser") {
@@ -683,8 +702,9 @@ export async function performSessionRun({
       mode === "browser" && browserCanReattach
         ? (userError?.details as { runtime?: BrowserRuntimeMetadata } | undefined)?.runtime
         : undefined;
+    const recoverableBrowserRuntime = mergeBrowserRuntime(currentBrowser?.runtime, browserRuntime);
     if (!cloudflareChallenge && browserCanReattach) {
-      logBrowserReattachGuidance(browserRuntime ?? currentBrowser?.runtime);
+      logBrowserReattachGuidance(recoverableBrowserRuntime);
     }
     await sessionStore.updateSession(sessionMeta.id, {
       status: "error",
@@ -695,7 +715,7 @@ export async function performSessionRun({
         ? {
             ...currentBrowser,
             config: browserConfig,
-            runtime: browserRuntime ?? currentBrowser?.runtime,
+            runtime: recoverableBrowserRuntime,
           }
         : undefined,
       response: responseMetadata,
@@ -716,6 +736,18 @@ export async function performSessionRun({
     }
     throw error;
   }
+}
+
+function mergeBrowserRuntime(
+  persisted: BrowserRuntimeMetadata | undefined,
+  sparse: BrowserRuntimeMetadata | undefined,
+): BrowserRuntimeMetadata | undefined {
+  if (!persisted) return sparse;
+  if (!sparse) return persisted;
+  const definedSparse = Object.fromEntries(
+    Object.entries(sparse).filter(([, value]) => value !== undefined),
+  ) as BrowserRuntimeMetadata;
+  return { ...persisted, ...definedSparse };
 }
 
 function mergeArtifacts(
@@ -1137,24 +1169,53 @@ async function autoReattachUntilComplete({
     attempt += 1;
     log(dim(`Auto-reattach attempt ${attempt}...`));
     try {
+      let persistedArtifacts: SessionArtifact[] | undefined;
       const reattachConfig: BrowserSessionConfig = {
         ...browserConfig,
         timeoutMs,
       };
       const result = await resumeBrowserSession(runtime, reattachConfig, logger, {
         promptPreview: sessionMeta.promptPreview,
+        persistResultBeforeClose: async (captured) => {
+          const capturedAnswer = captured.answerMarkdown || captured.answerText || "";
+          persistedArtifacts = await ensureSessionArtifacts({
+            sessionId: sessionMeta.id,
+            prompt: runOptions.prompt,
+            answerMarkdown: capturedAnswer,
+            conversationUrl: runtime.tabUrl,
+            browserConfig,
+            existingArtifacts: sessionMeta.artifacts,
+            logger,
+          });
+          const hasTranscript = persistedArtifacts?.some(
+            (artifact) => artifact.kind === "transcript",
+          );
+          const hasReport = persistedArtifacts?.some(
+            (artifact) => artifact.kind === "deep-research-report",
+          );
+          return Boolean(hasTranscript && (browserConfig.researchMode !== "deep" || hasReport));
+        },
       });
       const answerText = result.answerMarkdown || result.answerText || "";
+      const freshDeepResearchWarnings =
+        browserConfig.researchMode === "deep"
+          ? addDeepResearchPickerEvidenceWarning(
+              revalidateDeepResearchAnswerFields(result).warnings ?? [],
+              browserMetadata?.modelSelection,
+            )
+          : [];
       const outputTokens = estimateTokenCount(answerText);
-      const artifacts = await ensureSessionArtifacts({
-        sessionId: sessionMeta.id,
-        prompt: runOptions.prompt,
-        answerMarkdown: answerText,
-        conversationUrl: runtime.tabUrl,
-        browserConfig,
-        existingArtifacts: sessionMeta.artifacts,
-        logger,
-      });
+      const artifacts =
+        persistedArtifacts ??
+        (await ensureSessionArtifacts({
+          sessionId: sessionMeta.id,
+          prompt: runOptions.prompt,
+          answerMarkdown: answerText,
+          conversationUrl: runtime.tabUrl,
+          browserConfig,
+          existingArtifacts: sessionMeta.artifacts,
+          logger,
+        }));
       const logWriter = sessionStore.createLogWriter(sessionMeta.id);
       logWriter.logLine(`[auto-reattach] captured assistant response on attempt ${attempt}`);
       logWriter.logLine("Answer:");
@@ -1185,7 +1246,19 @@ async function autoReattachUntilComplete({
         browser: {
           ...browserMetadata,
           config: browserConfig,
-          runtime,
+          runtime: { ...runtime, assistantTurn: result.assistantTurn },
+          archive: result.archive ?? browserMetadata?.archive,
+          citationStatus:
+            browserConfig.researchMode === "deep"
+              ? result.citationStatus
+              : browserMetadata?.citationStatus,
+          warnings:
+            browserConfig.researchMode === "deep"
+              ? replaceDeepResearchEvidenceWarnings(
+                  browserMetadata?.warnings,
+                  freshDeepResearchWarnings,
+                )
+              : browserMetadata?.warnings,
         },
         artifacts: mergeArtifacts(sessionMeta.artifacts, artifacts),
         response: { status: "completed" },

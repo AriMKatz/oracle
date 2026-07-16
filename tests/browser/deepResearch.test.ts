@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import vm from "node:vm";
+import { createHash } from "node:crypto";
 
 // Mock delay to resolve instantly in tests
 vi.mock("../../src/browser/utils.js", async (importOriginal) => {
@@ -12,21 +13,35 @@ vi.mock("../../src/browser/utils.js", async (importOriginal) => {
 
 import {
   activateDeepResearch,
+  applyDeepResearchCitationSourcesForTest,
   buildActivateDeepResearchExpressionForTest,
+  buildDeepResearchActiveRecordMetadataExpressionForTest,
+  buildDeepResearchCitationSourcesExpressionForTest,
   buildDeepResearchCompletionPollExpressionForTest,
+  buildDeepResearchConversationRecordMetadataExpressionForTest,
   buildDeepResearchFrameStatusExpressionForTest,
   buildDeepResearchStatusExpressionForTest,
+  buildDeepResearchSubmittedUserTurnExpressionForTest,
   captureDeepResearchTargetKeys,
+  enrichDeepResearchTurnMetadataFromConversationRecordForTest,
   filterIncompleteDeepResearchReadForTest,
   findDeepResearchFrameIdForTest,
+  hasFreshDeepResearchContentProofForTest,
+  hasStableCompletedDeepResearchReadForTest,
+  hasVerifiedDeepResearchCitationUiContractForTest,
   isConfirmedDeepResearchTargetForTest,
   isDeepResearchPlaceholderTextForTest,
+  isSameDeepResearchOwnerForTest,
+  normalizeDeepResearchCitationSourcesForTest,
   pickPreferredDeepResearchReadForTest,
+  shouldSkipDeepResearchTargetForTest,
   waitForResearchPlanAutoConfirm,
   waitForDeepResearchCompletion,
   checkDeepResearchStatus,
 } from "../../src/browser/actions/deepResearch.js";
 import type { BrowserLogger } from "../../src/browser/types.js";
+
+const TEST_CITATION_NONCE = "0123456789abcdef0123456789abcdef";
 
 function createMockRuntime() {
   return {
@@ -42,7 +57,16 @@ function createMockLogger(): BrowserLogger {
 }
 
 function createFrameOwnerClient(
-  ownerTurnIndex: number | null | ((frameId: string) => number | null),
+  ownerTurn:
+    | number
+    | null
+    | { messageId?: string; turnId?: string; turnIndex?: number; modelSlug?: string }
+    | ((
+        frameId: string,
+      ) =>
+        | number
+        | null
+        | { messageId?: string; turnId?: string; turnIndex?: number; modelSlug?: string }),
 ) {
   let currentFrameId = "";
   return {
@@ -57,16 +81,59 @@ function createFrameOwnerClient(
       if (method === "Runtime.callFunctionOn") {
         return {
           result: {
-            value:
-              typeof ownerTurnIndex === "function"
-                ? ownerTurnIndex(currentFrameId)
-                : ownerTurnIndex,
+            value: typeof ownerTurn === "function" ? ownerTurn(currentFrameId) : ownerTurn,
           },
         };
       }
       return {};
     }),
   };
+}
+
+interface TestDomNode {
+  nodeType: number;
+  tagName?: string;
+  textContent: string;
+  innerText?: string;
+  childNodes?: TestDomNode[];
+  children?: TestDomNode[];
+  getAttribute?: (name: string) => string | null;
+  querySelectorAll?: (selector: string) => TestDomNode[];
+}
+
+function testText(text: string): TestDomNode {
+  return { nodeType: 3, textContent: text };
+}
+
+function testElement(
+  tagName: string,
+  children: TestDomNode[] = [],
+  attributes: Record<string, string> = {},
+): TestDomNode {
+  const elementChildren = children.filter((child) => child.nodeType === 1);
+  const node: TestDomNode = {
+    nodeType: 1,
+    tagName: tagName.toUpperCase(),
+    childNodes: children,
+    children: elementChildren,
+    textContent: children.map((child) => child.textContent).join(""),
+    getAttribute: (name) => attributes[name] ?? null,
+  };
+  node.innerText = node.textContent;
+  node.querySelectorAll = (selector) => {
+    const tags = selector
+      .split(",")
+      .map((part) => part.trim().toUpperCase())
+      .filter((part) => /^[A-Z]+$/.test(part));
+    const matches: TestDomNode[] = [];
+    const visit = (candidate: TestDomNode) => {
+      if (candidate.tagName && tags.includes(candidate.tagName)) matches.push(candidate);
+      for (const child of candidate.children ?? []) visit(child);
+    };
+    for (const child of elementChildren) visit(child);
+    return matches;
+  };
+  return node;
 }
 
 describe("activateDeepResearch", () => {
@@ -292,6 +359,117 @@ describe("Deep Research iframe helpers", () => {
     expect(expression).toContain("reportText");
   });
 
+  it("captures the exact submitted Deep Research user record message ID", async () => {
+    const messageNode = {
+      getAttribute: (name: string) => (name === "data-message-id" ? "user-message-exact" : null),
+    };
+    const userTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Deep research\nTest scientific prompt\nmedical-record.pdf",
+      textContent: "Deep research\nTest scientific prompt\nmedical-record.pdf",
+      querySelector: () => null,
+      querySelectorAll: (selector: string) =>
+        selector === "[data-message-id]" ? [messageNode] : [],
+    };
+
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "user-message-exact",
+          mapping: {
+            "user-message-exact": {
+              parent: null,
+              message: {
+                id: "user-message-exact",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+                metadata: {},
+              },
+            },
+          },
+        }),
+      });
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [userTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toEqual({
+      conversationId: "conversation-id",
+      messageId: "user-message-exact",
+      turnIndex: 0,
+    });
+  });
+
+  it("uses the pre-submit turn boundary while the exact user DOM is still unhydrated", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "user-message-exact",
+          mapping: {
+            "user-message-exact": {
+              parent: null,
+              message: {
+                id: "user-message-exact",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+                metadata: {},
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        4,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toEqual({
+      conversationId: "conversation-id",
+      messageId: "user-message-exact",
+      turnIndex: 4,
+    });
+  });
+
   it("captures completed localized reports without the English report heading", () => {
     const expression = buildDeepResearchFrameStatusExpressionForTest();
     const result = new vm.Script(expression).runInNewContext({
@@ -310,7 +488,12 @@ describe("Deep Research iframe helpers", () => {
           innerHTML: "<article>Audyt możliwości eksportu danych z profilu Steam</article>",
         },
       },
-    }) as { completed?: boolean; text?: string; textLength?: number };
+    }) as {
+      completed?: boolean;
+      text?: string;
+      textLength?: number;
+      declaredCitationCount?: number;
+    };
 
     expect(result.completed).toBe(true);
     expect(result.text).toContain("Audyt możliwości eksportu danych z profilu Steam");
@@ -319,6 +502,1450 @@ describe("Deep Research iframe helpers", () => {
     expect(result.text).not.toContain("citations");
     expect(result.text).not.toContain("searches");
     expect(result.textLength).toBeGreaterThan(40);
+    expect(result.declaredCitationCount).toBe(19);
+  });
+
+  it("records an explicit zero-citation UI counter as affirmative evidence", () => {
+    const result = new vm.Script(buildDeepResearchFrameStatusExpressionForTest()).runInNewContext({
+      document: {
+        body: {
+          innerText:
+            "Research completed in 1m\n" +
+            "0 citations\n" +
+            "Deep Research report\n" +
+            "This attachment-only report contains enough substantive text to be complete.",
+        },
+      },
+    }) as { completed?: boolean; declaredCitationCount?: number };
+
+    expect(result.completed).toBe(true);
+    expect(result.declaredCitationCount).toBe(0);
+  });
+
+  it("serializes citation-bearing iframe DOM to safe Markdown", () => {
+    const primaryLink = testElement("a", [testText("Primary study")], {
+      href: "https://example.com/source?trial=1",
+    });
+    const relativeLink = testElement("a", [testText("Supporting dataset")], {
+      href: "/dataset",
+    });
+    const unsafeLink = testElement("a", [testText("Unsafe label")], {
+      href: "javascript:alert(1)",
+    });
+    const article = testElement("article", [
+      testElement("h2", [testText("Evidence summary")]),
+      testElement("p", [
+        testText("The primary finding is supported by "),
+        primaryLink,
+        testElement("sup", [testText("1")], {
+          "data-citation-interactive": "true",
+          "data-citation-index": "1",
+        }),
+        testText(" and "),
+        relativeLink,
+        testText(". "),
+        unsafeLink,
+        testText(" remains readable without an executable destination."),
+      ]),
+      testElement("ul", [
+        testElement("li", [testText("First reproducible result")]),
+        testElement("li", [testText("Second reproducible result")]),
+      ]),
+      testElement("script", [testText("stealCredentials()")]),
+      testElement("button", [testText("Hidden interface control")]),
+    ]);
+    article.innerText =
+      "Evidence summary The primary finding is supported by Primary study and Supporting dataset. " +
+      "Unsafe label remains readable without an executable destination. First reproducible result " +
+      "Second reproducible result";
+    const body = testElement("body", [article]);
+    body.innerText =
+      "Research completed in 2m\n2 citations\nDeep Research report\n" + article.innerText;
+
+    const result = new vm.Script(buildDeepResearchFrameStatusExpressionForTest()).runInNewContext({
+      URL,
+      document: {
+        baseURI: "https://research.example.org/reports/current",
+        body,
+        querySelectorAll: () => [article],
+      },
+    }) as {
+      completed?: boolean;
+      text?: string;
+      citationMarkerNonce?: string;
+      citationRootComparable?: string;
+      citationReportNeedle?: string;
+      declaredCitationCount?: number;
+    };
+
+    expect(result.completed).toBe(true);
+    expect(result.text).toContain("## Evidence summary");
+    expect(result.text).toContain("[Primary study](<https://example.com/source?trial=1>)");
+    expect(result.citationMarkerNonce).toMatch(/^[a-f0-9]{32}$/);
+    expect(result.citationRootComparable?.length).toBeGreaterThan(40);
+    expect(result.citationReportNeedle).toBeTruthy();
+    expect(result.declaredCitationCount).toBe(2);
+    expect(result.text).toContain(
+      `[[ORACLE_DEEP_RESEARCH_CITATION_${result.citationMarkerNonce}_1]]`,
+    );
+    expect(result.text).toContain("[Supporting dataset](<https://research.example.org/dataset>)");
+    expect(result.text).toContain("Unsafe label");
+    expect(result.text).not.toContain("javascript:");
+    expect(result.text).not.toContain("stealCredentials");
+    expect(result.text).not.toContain("Hidden interface control");
+    expect(result.text).toContain("- First reproducible result");
+    expect(result.text).not.toContain("Research completed");
+  });
+
+  it("filters rendered Mermaid style and SVG descendants from preformatted blocks", () => {
+    const article = testElement("article", [
+      testElement("h2", [testText("Reproducible method")]),
+      testElement("p", [testText("The ordinary code remains available for review.")]),
+      testElement("pre", [
+        testElement("code", [
+          testText("print('ok')\n"),
+          testElement("style", [testText("#mermaid-live{fill:red}@keyframes dash{to{}}")]),
+          testElement("svg", [testText("Rendered diagram accessibility payload")]),
+        ]),
+      ]),
+    ]);
+    article.innerText =
+      "Reproducible method The ordinary code remains available for review. print('ok')";
+    const body = testElement("body", [article]);
+    body.innerText = `Research completed\nDeep Research report\n${article.innerText}`;
+
+    const result = new vm.Script(buildDeepResearchFrameStatusExpressionForTest()).runInNewContext({
+      URL,
+      document: {
+        baseURI: "https://research.example.org/report",
+        body,
+        querySelectorAll: () => [article],
+      },
+    }) as { completed?: boolean; text?: string };
+
+    expect(result.completed).toBe(true);
+    expect(result.text).toContain("print('ok')");
+    expect(result.text).not.toContain("#mermaid-live");
+    expect(result.text).not.toContain("@keyframes");
+    expect(result.text).not.toContain("Rendered diagram accessibility payload");
+  });
+
+  it("does not fall back to raw text when structured content is only a rendered diagram", () => {
+    const mermaidPayload = `#mermaid-live{${"fill:red;".repeat(20)}}@keyframes dash{to{}}`;
+    const article = testElement("article", [
+      testElement("pre", [
+        testElement("code", [
+          testElement("style", [testText(mermaidPayload)]),
+          testElement("svg", [testText("Rendered diagram payload")]),
+        ]),
+      ]),
+    ]);
+    article.innerText = mermaidPayload;
+    const body = testElement("body", [article]);
+    body.innerText = `Research completed\nDeep Research report\n${mermaidPayload}`;
+
+    const result = new vm.Script(buildDeepResearchFrameStatusExpressionForTest()).runInNewContext({
+      URL,
+      document: {
+        baseURI: "https://research.example.org/report",
+        body,
+        querySelectorAll: () => [article],
+      },
+    }) as { completed?: boolean; text?: string };
+
+    expect(result.completed).toBe(false);
+    expect(result.text).toBeUndefined();
+  });
+
+  it("does not rewrite literal marker-like code when linking a real citation", () => {
+    const literalMarker = "[[ORACLE_DEEP_RESEARCH_CITATION_1]]";
+    const article = testElement("article", [
+      testElement("h2", [testText("Collision safety")]),
+      testElement("p", [
+        testText("Literal example: "),
+        testElement("code", [testText(literalMarker)]),
+        testText(". Actual evidence"),
+        testElement("sup", [testText("1")], {
+          "data-citation-interactive": "true",
+          "data-citation-index": "1",
+        }),
+        testText(" supports the finding."),
+      ]),
+    ]);
+    article.innerText = `Collision safety Literal example: ${literalMarker}. Actual evidence supports the finding.`;
+    const body = testElement("body", [article]);
+    body.innerText = `Research completed\nDeep Research report\n${article.innerText}`;
+
+    const serialized = new vm.Script(
+      buildDeepResearchFrameStatusExpressionForTest(),
+    ).runInNewContext({
+      URL,
+      document: {
+        baseURI: "https://research.example.org/report",
+        body,
+        querySelectorAll: () => [article],
+      },
+    }) as { text: string; citationMarkerNonce: string };
+    const applied = applyDeepResearchCitationSourcesForTest(
+      serialized.text,
+      [{ index: 1, url: "https://example.com/actual" }],
+      {
+        citationMarkerNonce: serialized.citationMarkerNonce,
+        observedIndexes: [1],
+      },
+    );
+
+    expect(applied.markdown).toContain(literalMarker);
+    expect(applied.markdown).toContain("Actual evidence[1](<https://example.com/actual>)");
+    expect(applied.markdown).not.toContain(
+      `ORACLE_DEEP_RESEARCH_CITATION_${serialized.citationMarkerNonce}`,
+    );
+    expect(applied.status).toEqual({ total: 1, linked: 1, missingIndexes: [] });
+  });
+
+  it("extracts an exact citation URL only from the matching main-world React item", () => {
+    const exactChip = {
+      getAttribute: (name: string) => (name === "data-citation-index" ? "3" : null),
+      __reactFiber$oracle: {
+        return: {
+          return: {
+            memoizedProps: {
+              item: {
+                index: 3,
+                url: "https://ntrs.nasa.gov/citations/20220016184",
+                reference: {
+                  items: [
+                    {
+                      title: "NASA technical report",
+                      url: "https://ntrs.nasa.gov/citations/20220016184",
+                    },
+                  ],
+                  safe_urls: ["https://unselected.example/supporting"],
+                },
+              },
+            },
+          },
+        },
+      },
+    };
+    const mismatchedChip = {
+      getAttribute: (name: string) => (name === "data-citation-index" ? "4" : null),
+      __reactFiber$oracle: {
+        memoizedProps: {
+          item: { index: 99, url: "https://example.com/wrong-index" },
+        },
+      },
+    };
+
+    const result = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest(),
+    ).runInNewContext({
+      URL,
+      document: { querySelectorAll: () => [exactChip, mismatchedChip] },
+      location: { href: "https://connector.example/report" },
+    });
+
+    expect(result).toEqual({
+      observedIndexes: [3, 4],
+      sources: [
+        {
+          index: 3,
+          url: "https://ntrs.nasa.gov/citations/20220016184",
+          label: "NASA technical report",
+        },
+      ],
+    });
+    expect(JSON.stringify(result)).not.toContain("unselected.example");
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+  });
+
+  it("scopes citation URL extraction to the exact serialized report root", () => {
+    const chip = (url: string) => ({
+      getAttribute: (name: string) => (name === "data-citation-index" ? "1" : null),
+      __reactFiber$oracle: { memoizedProps: { item: { index: 1, url } } },
+    });
+    const staleChip = chip("https://example.com/stale") as ReturnType<typeof chip> & {
+      parentElement?: unknown;
+    };
+    const currentChip = chip("https://example.com/current") as ReturnType<typeof chip> & {
+      parentElement?: unknown;
+    };
+    const staleRoot = {
+      innerText: "stale hidden report content",
+      textContent: "stale hidden report content",
+      querySelectorAll: () => [staleChip],
+    };
+    const currentText = "current verified report content";
+    const currentRoot = {
+      innerText: currentText,
+      textContent: currentText,
+      querySelectorAll: () => [currentChip],
+    };
+    staleChip.parentElement = staleRoot;
+    currentChip.parentElement = currentRoot;
+    const normalizedCurrentText = currentText.toLowerCase();
+
+    const result = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest({
+        rootComparable: normalizedCurrentText,
+        reportNeedle: normalizedCurrentText.slice(0, 120),
+      }),
+    ).runInNewContext({
+      URL,
+      document: {
+        body: staleRoot,
+        querySelectorAll: (selector: string) =>
+          selector === 'article, main, [role="main"]' ? [staleRoot, currentRoot] : [],
+      },
+      location: { href: "https://connector.example/report" },
+    });
+
+    expect(result).toEqual({
+      observedIndexes: [1],
+      sources: [{ index: 1, url: "https://example.com/current" }],
+    });
+  });
+
+  it("ignores an exact stale report root hidden only by an ancestor", () => {
+    const shared = `Verified report opening ${"x".repeat(140)}`;
+    const staleText = `${shared} STALE-HIDDEN-SENTINEL`;
+    const currentText = `${shared} CURRENT-ONLY-SENTINEL with additional verified detail`;
+    type ParentNode = TestDomNode & { parentElement: TestDomNode | null };
+    type CitationNode = ParentNode & { __reactFiber$oracle: unknown };
+
+    const staleChip = testElement("sup", [testText("1")], {
+      "data-citation-interactive": "true",
+      "data-citation-index": "1",
+    }) as CitationNode;
+    staleChip.__reactFiber$oracle = {
+      memoizedProps: { item: { index: 1, url: "https://stale.example/wrong" } },
+    };
+    const currentChip = testElement("sup", [testText("1")], {
+      "data-citation-interactive": "true",
+      "data-citation-index": "1",
+    }) as CitationNode;
+    currentChip.__reactFiber$oracle = {
+      memoizedProps: { item: { index: 1, url: "https://current.example/right" } },
+    };
+
+    const staleRoot = testElement("article", [testElement("p", [testText(staleText), staleChip])]);
+    staleRoot.innerText = staleText;
+    staleRoot.querySelectorAll = () => [staleChip];
+    const currentRoot = testElement("article", [
+      testElement("p", [testText(currentText), currentChip]),
+    ]);
+    currentRoot.innerText = currentText;
+    currentRoot.querySelectorAll = () => [currentChip];
+    const hiddenAncestor = testElement("section", [staleRoot], {
+      style: "display: none",
+    });
+    const body = testElement("body", [hiddenAncestor, currentRoot]);
+    body.innerText = `Research completed\nDeep Research report\n${currentText}`;
+
+    (body as ParentNode).parentElement = null;
+    (hiddenAncestor as ParentNode).parentElement = body;
+    (staleRoot as ParentNode).parentElement = hiddenAncestor;
+    staleChip.parentElement = staleRoot;
+    (currentRoot as ParentNode).parentElement = body;
+    currentChip.parentElement = currentRoot;
+
+    const document = {
+      baseURI: "https://research.example/report",
+      body,
+      querySelectorAll: () => [staleRoot, currentRoot],
+    };
+    const serialized = new vm.Script(
+      buildDeepResearchFrameStatusExpressionForTest(),
+    ).runInNewContext({ URL, document }) as {
+      text?: string;
+      citationRootComparable?: string;
+      citationReportNeedle?: string;
+    };
+
+    expect(serialized.text).toContain("CURRENT-ONLY-SENTINEL");
+    expect(serialized.text).not.toContain("STALE-HIDDEN-SENTINEL");
+
+    const citationScan = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest({
+        rootComparable: serialized.citationRootComparable,
+        reportNeedle: serialized.citationReportNeedle,
+      }),
+    ).runInNewContext({
+      URL,
+      document,
+      location: { href: "https://research.example/report" },
+    });
+
+    expect(citationScan).toEqual({
+      observedIndexes: [1],
+      sources: [{ index: 1, url: "https://current.example/right" }],
+    });
+  });
+
+  it("does not use a hidden stale chip to supply a visible citation URL", () => {
+    const currentText = "current verified report content";
+    const visibleChip = {
+      parentElement: null as unknown,
+      getAttribute: (name: string) => (name === "data-citation-index" ? "1" : null),
+    };
+    const hiddenChip = {
+      parentElement: null as unknown,
+      getAttribute: (name: string) => {
+        if (name === "data-citation-index") return "1";
+        if (name === "hidden") return "";
+        return null;
+      },
+      __reactFiber$oracle: {
+        memoizedProps: { item: { index: 1, url: "https://stale.example/wrong" } },
+      },
+    };
+    const currentRoot = {
+      innerText: currentText,
+      textContent: currentText,
+      querySelectorAll: () => [visibleChip, hiddenChip],
+    };
+    visibleChip.parentElement = currentRoot;
+    hiddenChip.parentElement = currentRoot;
+
+    const result = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest({
+        rootComparable: currentText,
+        reportNeedle: currentText,
+      }),
+    ).runInNewContext({
+      URL,
+      document: {
+        body: currentRoot,
+        querySelectorAll: () => [currentRoot],
+      },
+      location: { href: "https://connector.example/report" },
+    });
+
+    expect(result).toEqual({ observedIndexes: [1], sources: [] });
+  });
+
+  it("rejects citation metadata when the report tail changed at the same length", () => {
+    const prefix = "p".repeat(180);
+    const serializedText = `${prefix}x`;
+    const mutatedText = `${prefix}y`;
+    const mutatedRoot = {
+      innerText: mutatedText,
+      textContent: mutatedText,
+      querySelectorAll: () => [],
+    };
+
+    const result = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest({
+        rootComparable: serializedText,
+        reportNeedle: prefix.slice(0, 120),
+      }),
+    ).runInNewContext({
+      URL,
+      document: {
+        body: mutatedRoot,
+        querySelectorAll: () => [mutatedRoot],
+      },
+      location: { href: "https://connector.example/report" },
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("rejects a completed reread when an exact citation URL changes", () => {
+    const shared = {
+      completed: true,
+      inProgress: false,
+      textLength: 120,
+      contentSha256: "a".repeat(64),
+      citationStatus: { total: 1, linked: 1, missingIndexes: [] },
+    };
+    const first = { ...shared, text: "Claim[1](<https://example.com/first>)" };
+    const same = { ...shared, text: first.text };
+    const changed = { ...shared, text: "Claim[1](<https://example.com/second>)" };
+
+    expect(hasStableCompletedDeepResearchReadForTest(first, same)).toBe(true);
+    expect(hasStableCompletedDeepResearchReadForTest(first, changed)).toBe(false);
+  });
+
+  it("preserves a citation URL beyond the label limit and reports chips whose URL is unavailable", () => {
+    const longUrl = `https://example.com/source?payload=${"x".repeat(900)}`;
+    const exactChip = {
+      getAttribute: (name: string) => (name === "data-citation-index" ? "7" : null),
+      __reactFiber$oracle: {
+        memoizedProps: {
+          item: { index: 7, url: longUrl, attribution: "L".repeat(700) },
+        },
+      },
+    };
+    const unavailableChip = {
+      getAttribute: (name: string) => (name === "data-citation-index" ? "8" : null),
+    };
+
+    const result = new vm.Script(
+      buildDeepResearchCitationSourcesExpressionForTest(),
+    ).runInNewContext({
+      URL,
+      document: { querySelectorAll: () => [exactChip, unavailableChip] },
+      location: { href: "https://connector.example/report" },
+    });
+
+    expect(result).toEqual({
+      observedIndexes: [7, 8],
+      sources: [{ index: 7, url: longUrl, label: "L".repeat(500) }],
+    });
+    expect(result.sources[0].url).toHaveLength(longUrl.length);
+  });
+
+  it("leaves a citation unlinked when same-index React items disagree on the URL", () => {
+    const ambiguousChip = {
+      getAttribute: (name: string) => (name === "data-citation-index" ? "5" : null),
+      __reactFiber$oracle: {
+        memoizedProps: {
+          item: { index: 5, url: "https://example.com/first" },
+        },
+        return: {
+          memoizedProps: {
+            item: { index: 5, url: "https://example.com/second" },
+          },
+        },
+      },
+    };
+
+    const scan = new vm.Script(buildDeepResearchCitationSourcesExpressionForTest()).runInNewContext(
+      {
+        URL,
+        document: { querySelectorAll: () => [ambiguousChip] },
+        location: { href: "https://connector.example/report" },
+      },
+    );
+    expect(scan).toEqual({ observedIndexes: [5], sources: [] });
+
+    const applied = applyDeepResearchCitationSourcesForTest(
+      `Claim[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_5]]`,
+      scan.sources,
+      {
+        citationMarkerNonce: TEST_CITATION_NONCE,
+        observedIndexes: scan.observedIndexes,
+      },
+    );
+    expect(applied).toEqual({
+      markdown: "Claim[5]",
+      status: { total: 1, linked: 0, missingIndexes: [5] },
+    });
+  });
+
+  it("trims before enforcing the 4096-character citation URL limit", () => {
+    const withinLimit = `https://example.com/${"a".repeat(4075)}`;
+    const normalized = normalizeDeepResearchCitationSourcesForTest({
+      observedIndexes: [1, 2],
+      sources: [
+        { index: 1, url: `  ${withinLimit}  ` },
+        { index: 2, url: `https://example.com/${"b".repeat(4090)}` },
+      ],
+    });
+
+    expect(withinLimit.length).toBeLessThanOrEqual(4096);
+    expect(normalized).toEqual({
+      observedIndexes: [1, 2],
+      sources: [{ index: 1, url: withinLimit }],
+    });
+  });
+
+  it("links exact citation markers and leaves missing or contradictory indexes unguessed", () => {
+    const result = applyDeepResearchCitationSourcesForTest(
+      `Finding[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_1]] and ` +
+        `repeat[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_1]]. ` +
+        `Missing[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_2]] ` +
+        `conflict[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_3]].`,
+      [
+        { index: 1, url: "https://example.com/one" },
+        { index: 3, url: "https://example.com/three-a" },
+        { index: 3, url: "https://example.com/three-b" },
+      ],
+      {
+        citationMarkerNonce: TEST_CITATION_NONCE,
+        observedIndexes: [1, 2, 3],
+      },
+    );
+
+    expect(result.markdown).toContain("Finding[1](<https://example.com/one>)");
+    expect(result.markdown).toContain("repeat[1](<https://example.com/one>)");
+    expect(result.markdown).toContain("Missing[2]");
+    expect(result.markdown).toContain("conflict[3]");
+    expect(result.markdown).not.toContain("ORACLE_DEEP_RESEARCH_CITATION");
+    expect(result.status).toEqual({ total: 3, linked: 1, missingIndexes: [2, 3] });
+  });
+
+  it("reports a successful zero-citation scan explicitly", () => {
+    expect(applyDeepResearchCitationSourcesForTest("No citations in this report.", [])).toEqual({
+      markdown: "No citations in this report.",
+      status: { total: 0, linked: 0, missingIndexes: [] },
+    });
+  });
+
+  it("requires affirmative citation UI evidence before certifying an empty scan", () => {
+    const emptyScan = { observedIndexes: [], sources: [] };
+
+    expect(hasVerifiedDeepResearchCitationUiContractForTest(emptyScan, undefined)).toBe(false);
+    expect(hasVerifiedDeepResearchCitationUiContractForTest(emptyScan, 0)).toBe(true);
+    expect(
+      hasVerifiedDeepResearchCitationUiContractForTest(
+        { observedIndexes: [1], sources: [] },
+        undefined,
+      ),
+    ).toBe(true);
+  });
+
+  it("does not report a clean zero scan when the UI declared citations", () => {
+    expect(
+      applyDeepResearchCitationSourcesForTest("Report body with citation selector drift.", [], {
+        declaredCitationCount: 2,
+      }),
+    ).toEqual({
+      markdown: "Report body with citation selector drift.",
+      status: { total: 2, linked: 0, missingIndexes: [1, 2] },
+    });
+  });
+
+  it("distinguishes an unavailable citation scan from a successful zero-citation scan", () => {
+    expect(
+      applyDeepResearchCitationSourcesForTest("Report text.", [], { scanAvailable: false }),
+    ).toEqual({ markdown: "Report text." });
+  });
+
+  it("reads only allowlisted Deep Research metadata from the bound conversation branch", async () => {
+    const ownerMessageId = "owner-message";
+    const token = "sensitive-browser-token";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ accessToken: token }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "final-message",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                metadata: { deep_research_version: "standard", private_prompt: "do not return" },
+              },
+            },
+            [ownerMessageId]: {
+              parent: "user-message",
+              message: {
+                id: ownerMessageId,
+                author: { role: "assistant" },
+                content: { content_type: "code", parts: ["private report body"] },
+                metadata: {
+                  model_slug: "gpt-5-5-instant",
+                  resolved_model_slug: "gpt-5-5-instant",
+                  default_model_slug: "gpt-5-6-pro",
+                  private_field: "do not return",
+                },
+              },
+            },
+            "final-message": {
+              parent: ownerMessageId,
+              message: {
+                id: "final-message",
+                author: { role: "assistant" },
+                end_turn: true,
+                content: { content_type: "text", parts: ["Research completed"] },
+                metadata: { model_slug: "unrelated-final-model" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = (await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest(ownerMessageId, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    })) as Record<string, unknown>;
+
+    expect(result).toEqual({
+      messageId: ownerMessageId,
+      finalMessageId: "final-message",
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record",
+    });
+    expect(JSON.stringify(result)).not.toContain(token);
+    expect(JSON.stringify(result)).not.toContain("private report body");
+    expect(JSON.stringify(result)).not.toContain("do not return");
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "/backend-api/conversation/conversation-id",
+      expect.objectContaining({
+        credentials: "same-origin",
+        headers: { authorization: `Bearer ${token}` },
+      }),
+    );
+  });
+
+  it("resolves a request-WEB report turn through its matching active Deep Research branch", async () => {
+    const token = "sensitive-browser-token";
+    const userTurn = {
+      innerText: "Deep research\nTest scientific prompt",
+      textContent: "Deep research\nTest scientific prompt",
+      getAttribute: (name: string) => {
+        if (name === "data-turn") return "user";
+        if (name === "data-message-id") return "user-message";
+        return null;
+      },
+      querySelector: () => null,
+    };
+    const reportTurn = {
+      innerText: "Completed Deep Research report",
+      textContent: "Completed Deep Research report",
+      getAttribute: (name: string) => {
+        if (name === "data-turn") return "assistant";
+        if (name === "data-turn-id" || name === "data-turn-id-container") {
+          return "request-WEB:410834d6-live-shape-0";
+        }
+        return null;
+      },
+      querySelector: () => null,
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ accessToken: token }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "final-message",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                content: { content_type: "text", parts: ["@deep research Test scientific prompt"] },
+                metadata: {
+                  deep_research_version: "standard",
+                  request_id: "request-1",
+                  private_prompt_metadata: "do not return",
+                },
+              },
+            },
+            "owner-message": {
+              parent: "user-message",
+              message: {
+                id: "owner-message",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                content: { content_type: "code", parts: ["private report body"] },
+                metadata: {
+                  model_slug: "gpt-5-5-instant",
+                  resolved_model_slug: "gpt-5-5-instant",
+                  default_model_slug: "gpt-5-6-pro",
+                  request_id: "request-1",
+                  private_field: "do not return",
+                },
+              },
+            },
+            "tool-message": {
+              parent: "owner-message",
+              message: {
+                id: "tool-message",
+                author: { role: "tool" },
+                metadata: { request_id: "request-1" },
+              },
+            },
+            "final-message": {
+              parent: "tool-message",
+              message: {
+                id: "final-message",
+                author: { role: "assistant" },
+                end_turn: true,
+                content: { content_type: "text", parts: ["Research completed"] },
+                metadata: { model_slug: "unrelated-final-model" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = (await new vm.Script(
+      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [userTurn, reportTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    })) as Record<string, unknown>;
+
+    expect(result).toEqual({
+      messageId: "owner-message",
+      finalMessageId: "final-message",
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record",
+    });
+    expect(JSON.stringify(result)).not.toContain(token);
+    expect(JSON.stringify(result)).not.toContain("private report body");
+    expect(JSON.stringify(result)).not.toContain("do not return");
+  });
+
+  it("does not resolve a request-WEB report turn to a different Deep Research prompt", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "owner-message",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                content: { parts: ["@deep research Different prompt"] },
+                metadata: { deep_research_version: "standard", request_id: "request-1" },
+              },
+            },
+            "owner-message": {
+              parent: "user-message",
+              message: {
+                id: "owner-message",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                metadata: { request_id: "request-1" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: {
+        querySelectorAll: () => [
+          {
+            innerText: "Deep research\nTest scientific prompt",
+            textContent: "Deep research\nTest scientific prompt",
+            getAttribute: (name: string) => {
+              if (name === "data-turn") return "user";
+              if (name === "data-message-id") return "user-message";
+              return null;
+            },
+            querySelector: () => null,
+          },
+          {
+            getAttribute: (name: string) => (name === "data-turn" ? "assistant" : null),
+            querySelector: () => null,
+          },
+        ],
+      },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("does not bind a virtualized current turn to an older same-prompt record branch", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "old-owner",
+          mapping: {
+            "old-user": {
+              parent: null,
+              message: {
+                id: "old-user",
+                author: { role: "user" },
+                content: { parts: ["@deep research Same prompt"] },
+                metadata: { deep_research_version: "standard", request_id: "old-request" },
+              },
+            },
+            "old-owner": {
+              parent: "old-user",
+              message: {
+                id: "old-owner",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                metadata: { request_id: "old-request" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: {
+        querySelectorAll: () => [
+          {
+            innerText: "Deep research\nSame prompt",
+            textContent: "Deep research\nSame prompt",
+            getAttribute: (name: string) => {
+              if (name === "data-turn") return "user";
+              if (name === "data-message-id") return "current-user";
+              return null;
+            },
+            querySelector: () => null,
+          },
+          {
+            getAttribute: (name: string) => (name === "data-turn" ? "assistant" : null),
+            querySelector: () => null,
+          },
+        ],
+      },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("rejects regenerated sibling report owners under the same exact user message", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "final-a",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                content: { parts: ["@deep research Same prompt"] },
+                metadata: { deep_research_version: "standard", request_id: "request-1" },
+              },
+            },
+            "owner-a": {
+              parent: "user-message",
+              message: {
+                id: "owner-a",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                metadata: { request_id: "request-1" },
+              },
+            },
+            "final-a": {
+              parent: "owner-a",
+              message: {
+                id: "final-a",
+                author: { role: "assistant" },
+                end_turn: true,
+                metadata: { request_id: "request-1" },
+              },
+            },
+            "owner-b": {
+              parent: "user-message",
+              message: {
+                id: "owner-b",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                metadata: { request_id: "request-1" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: {
+        querySelectorAll: () => [
+          {
+            innerText: "Deep research\nSame prompt",
+            textContent: "Deep research\nSame prompt",
+            getAttribute: (name: string) => {
+              if (name === "data-turn") return "user";
+              if (name === "data-message-id") return "user-message";
+              return null;
+            },
+            querySelector: () => null,
+          },
+          {
+            getAttribute: (name: string) => {
+              if (name === "data-turn") return "assistant";
+              if (name === "data-turn-id") return "request-WEB:stable";
+              return null;
+            },
+            querySelector: () => null,
+          },
+        ],
+      },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("fails closed when the bound DOM report turn changes during record fetch", async () => {
+    let reportKey = "request-WEB:before";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => {
+          reportKey = "request-WEB:after";
+          return {
+            current_node: "owner-message",
+            mapping: {
+              "user-message": {
+                parent: null,
+                message: {
+                  id: "user-message",
+                  author: { role: "user" },
+                  content: { parts: ["@deep research Test prompt"] },
+                  metadata: { deep_research_version: "standard", request_id: "request-1" },
+                },
+              },
+              "owner-message": {
+                parent: "user-message",
+                message: {
+                  id: "owner-message",
+                  author: { role: "assistant" },
+                  recipient: "api_tool.call_tool",
+                  end_turn: false,
+                  metadata: { request_id: "request-1" },
+                },
+              },
+            },
+          };
+        },
+      });
+    const userTurn = {
+      innerText: "Deep research\nTest prompt",
+      textContent: "Deep research\nTest prompt",
+      getAttribute: (name: string) => {
+        if (name === "data-turn") return "user";
+        if (name === "data-message-id") return "user-message";
+        return null;
+      },
+      querySelector: () => null,
+    };
+    const reportTurn = {
+      getAttribute: (name: string) => {
+        if (name === "data-turn") return "assistant";
+        if (name === "data-testid") return "conversation-turn-2";
+        if (name === "data-turn-id") return reportKey;
+        return null;
+      },
+      querySelector: () => null,
+    };
+
+    const result = await new vm.Script(
+      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [userTurn, reportTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("uses the owner message as the exact final identity when the owner is terminal", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "owner-message",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                metadata: { deep_research_version: "standard" },
+              },
+            },
+            "owner-message": {
+              parent: "user-message",
+              message: {
+                id: "owner-message",
+                author: { role: "assistant" },
+                end_turn: true,
+                metadata: {
+                  model_slug: "gpt-5-5-instant",
+                  resolved_model_slug: "gpt-5-5-instant",
+                  default_model_slug: "gpt-5-6-pro",
+                },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      messageId: "owner-message",
+      finalMessageId: "owner-message",
+      modelSlug: "gpt-5-5-instant",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+    });
+  });
+
+  it("does not fetch authenticated metadata from an arbitrary configured origin", async () => {
+    const fetchMock = vi.fn();
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "oracle-emulator.example",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not fetch authenticated metadata over an insecure ChatGPT origin", async () => {
+    const fetchMock = vi.fn();
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "http:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an authoritative owner whose prior user is not the submitted user message", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "owner-message",
+          mapping: {
+            "other-user": {
+              parent: null,
+              message: {
+                id: "other-user",
+                author: { role: "user" },
+                metadata: { deep_research_version: "standard", request_id: "request-2" },
+              },
+            },
+            "owner-message": {
+              parent: "other-user",
+              message: {
+                id: "owner-message",
+                author: { role: "assistant" },
+                end_turn: true,
+                metadata: { request_id: "request-2" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest(
+        "owner-message",
+        1_000,
+        "conversation-id",
+        "submitted-user",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("does not fetch authenticated metadata after leaving the pinned conversation", async () => {
+    const fetchMock = vi.fn();
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest(
+        "owner-message",
+        1_000,
+        "submitted-conversation",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/other-conversation",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates the pinned conversation into authoritative metadata enrichment", async () => {
+    const rawClient = {
+      send: vi.fn(async (_method: string, params?: { expression?: string }) => {
+        expect(params?.expression).toContain(
+          'const expectedConversationId = "submitted-conversation";',
+        );
+        return { result: { value: null } };
+      }),
+    };
+
+    await enrichDeepResearchTurnMetadataFromConversationRecordForTest(
+      rawClient,
+      { messageId: "owner-message", turnIndex: 2 },
+      "page-session",
+      "submitted-conversation",
+    );
+
+    expect(rawClient.send).toHaveBeenCalledOnce();
+  });
+
+  it("does not backfill fields missing from an authoritative conversation record", async () => {
+    const rawClient = {
+      send: vi.fn(async () => ({
+        result: {
+          value: {
+            messageId: "owner-message",
+            metadataSource: "chatgpt-conversation-record",
+          },
+        },
+      })),
+    };
+
+    const result = await enrichDeepResearchTurnMetadataFromConversationRecordForTest(
+      rawClient,
+      {
+        messageId: "owner-message",
+        finalMessageId: "dom-final",
+        turnId: "conversation-turn-3",
+        turnIndex: 2,
+        modelSlug: "dom-model",
+        resolvedModelSlug: "dom-resolved",
+        defaultModelSlug: "dom-default",
+        deepResearchVersion: "dom-version",
+      },
+      "page-session",
+    );
+
+    expect(result).toEqual({
+      messageId: "owner-message",
+      turnId: "conversation-turn-3",
+      turnIndex: 2,
+      modelSlug: null,
+      metadataSource: "chatgpt-conversation-record",
+    });
+    expect(rawClient.send).toHaveBeenCalledWith(
+      "Runtime.evaluate",
+      expect.objectContaining({ awaitPromise: true, returnByValue: true }),
+      "page-session",
+    );
+  });
+
+  it("fails closed when the bound owner is not on the active conversation branch", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "other-message",
+          mapping: {
+            "owner-message": {
+              parent: null,
+              message: { id: "owner-message", author: { role: "assistant" }, metadata: {} },
+            },
+            "other-message": {
+              parent: null,
+              message: { id: "other-message", author: { role: "assistant" }, metadata: {} },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("fails closed on a cyclic conversation-record branch", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "owner-message",
+          mapping: {
+            "owner-message": {
+              parent: "cycle-message",
+              message: { id: "owner-message", author: { role: "assistant" }, metadata: {} },
+            },
+            "cycle-message": {
+              parent: "owner-message",
+              message: { id: "cycle-message", author: { role: "tool" }, metadata: {} },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 1_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
   });
 });
 
@@ -362,6 +1989,73 @@ describe("pickPreferredDeepResearchReadForTest", () => {
       12,
     );
     expect(pickPreferredDeepResearchReadForTest(null, inProgress(7))?.textLength).toBe(7);
+  });
+});
+
+describe("shouldSkipDeepResearchTargetForTest", () => {
+  it("keeps baseline targets excluded when strict owner-turn proof is unavailable", () => {
+    expect(shouldSkipDeepResearchTargetForTest("baseline", ["baseline"], true, -1, false)).toBe(
+      true,
+    );
+    expect(shouldSkipDeepResearchTargetForTest("baseline", ["baseline"], true, -1, true)).toBe(
+      true,
+    );
+  });
+
+  it("reconsiders a reused target only under strict owner-turn scoping", () => {
+    expect(shouldSkipDeepResearchTargetForTest("baseline", ["baseline"], true, 1, true)).toBe(
+      false,
+    );
+    expect(shouldSkipDeepResearchTargetForTest("baseline", ["baseline"], false, 1, true)).toBe(
+      true,
+    );
+    expect(shouldSkipDeepResearchTargetForTest("baseline", ["baseline"], true, 1, false)).toBe(
+      true,
+    );
+    expect(shouldSkipDeepResearchTargetForTest("fresh", ["baseline"], false, 1, true)).toBe(false);
+  });
+});
+
+describe("reused Deep Research target freshness", () => {
+  it("rejects unchanged completed baseline content even after a reset transition", () => {
+    const baseline = {
+      targetId: "baseline",
+      completed: true,
+      contentSha256: "a".repeat(64),
+    };
+    expect(hasFreshDeepResearchContentProofForTest(baseline, "a".repeat(64))).toBe(false);
+    expect(hasFreshDeepResearchContentProofForTest(baseline, "b".repeat(64))).toBe(true);
+  });
+
+  it("accepts a completed transition from a captured non-completed baseline", () => {
+    expect(
+      hasFreshDeepResearchContentProofForTest(
+        { targetId: "baseline", completed: false },
+        "a".repeat(64),
+      ),
+    ).toBe(true);
+  });
+
+  it("fails closed when a baseline target was confirmed but unreadable", () => {
+    expect(
+      hasFreshDeepResearchContentProofForTest(
+        { targetId: "baseline", completed: null },
+        "a".repeat(64),
+      ),
+    ).toBe(false);
+  });
+
+  it("requires the same owner identity on both sides of the report read", () => {
+    const owner = {
+      messageId: "message-current",
+      turnId: "conversation-turn-2",
+      turnIndex: 1,
+    };
+    expect(isSameDeepResearchOwnerForTest(owner, owner)).toBe(true);
+    expect(
+      isSameDeepResearchOwnerForTest(owner, { ...owner, messageId: "message-remounted" }),
+    ).toBe(false);
+    expect(isSameDeepResearchOwnerForTest(owner, { ...owner, turnIndex: 2 })).toBe(false);
   });
 });
 
@@ -441,6 +2135,26 @@ describe("waitForDeepResearchCompletion", () => {
   beforeEach(() => {
     mockRuntime = createMockRuntime();
     mockLogger = createMockLogger();
+  });
+
+  it("fails closed when scoped owner verification is required without a turn index", async () => {
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        60_000,
+        undefined,
+        undefined,
+        undefined,
+        { requireScopedTargetOwner: true },
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        code: "deep-research-scope-unavailable",
+        stage: "deep-research-scope",
+      },
+    });
+    expect(mockRuntime.evaluate).not.toHaveBeenCalled();
   });
 
   it("captures only existing targets attached to the current page session", async () => {
@@ -543,6 +2257,8 @@ describe("waitForDeepResearchCompletion", () => {
           html: "<p>Research report content</p>",
           turnId: "t1",
           messageId: "m1",
+          turnIndex: 1,
+          modelSlug: "gpt-5-6-pro",
         },
       },
     });
@@ -553,6 +2269,12 @@ describe("waitForDeepResearchCompletion", () => {
 
     const result = await waitForDeepResearchCompletion(mockRuntime as never, mockLogger, 60_000);
     expect(result.text).toBe("Research report content");
+    expect(result.assistantTurn).toMatchObject({
+      messageId: "m1",
+      turnId: "t1",
+      turnIndex: 1,
+      modelSlug: "gpt-5-6-pro",
+    });
   });
 
   it("fails clearly when ChatGPT silently returns a normal response", async () => {
@@ -813,6 +2535,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -894,6 +2617,10 @@ describe("waitForDeepResearchCompletion", () => {
           1,
           undefined,
           mockClient as never,
+          {
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
         ),
       ).rejects.toThrow(/did not complete/);
       // The foreign target must never be reached, regardless of the browser-wide scan.
@@ -919,6 +2646,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -994,6 +2722,10 @@ describe("waitForDeepResearchCompletion", () => {
           1,
           undefined,
           mockClient as never,
+          {
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
         ),
       ).rejects.toThrow(/did not complete/);
       // Every auto-attach was bound to the page session — never browser-wide.
@@ -1013,6 +2745,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -1096,6 +2829,10 @@ describe("waitForDeepResearchCompletion", () => {
           1,
           undefined,
           mockClient as never,
+          {
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
         ),
       ).rejects.toThrow(/did not complete/);
       expect(evaluatedSessions).not.toContain("foreign-child-session");
@@ -1105,7 +2842,7 @@ describe("waitForDeepResearchCompletion", () => {
     }
   });
 
-  it("accepts a fresh OOPIF report when its frame owner is unavailable", async () => {
+  it("rejects a fresh baseline-filtered OOPIF report when its scoped owner is unavailable", async () => {
     mockRuntime.evaluate.mockResolvedValue({
       result: {
         value: {
@@ -1114,6 +2851,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 11,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -1188,24 +2926,40 @@ describe("waitForDeepResearchCompletion", () => {
       }),
     };
 
-    const result = await waitForDeepResearchCompletion(
-      mockRuntime as never,
-      mockLogger,
-      60_000,
-      1,
-      undefined,
-      mockClient as never,
-      { ignoredTargetKeys: ["old-target"], targetBaselineCaptured: true },
-    );
-
-    expect(result.text).toBe("CURRENT_REPORT https://example.com/current");
-    expect(evaluatedSessions).toContain("old-session");
-    expect(evaluatedSessions).toContain("current-session");
-    expect(mockClient.send).not.toHaveBeenCalledWith(
-      "DOM.getFrameOwner",
-      expect.anything(),
-      "page-session",
-    );
+    let nowCalls = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      nowCalls += 1;
+      return nowCalls < 8 ? 1_000 : 2_000;
+    });
+    try {
+      await expect(
+        waitForDeepResearchCompletion(
+          mockRuntime as never,
+          mockLogger,
+          100,
+          1,
+          undefined,
+          mockClient as never,
+          {
+            targetBaseline: [{ targetId: "old-target", completed: false }],
+            targetBaselineCaptured: true,
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
+        ),
+      ).rejects.toThrow(/did not complete/);
+      // A baseline target may be reused after submission, so it is read and
+      // then rejected because current-turn owner evidence is unavailable.
+      expect(evaluatedSessions).toContain("old-session");
+      expect(evaluatedSessions).toContain("current-session");
+      expect(mockClient.send).toHaveBeenCalledWith(
+        "DOM.getFrameOwner",
+        { frameId: "current-session-frame" },
+        "page-session",
+      );
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 
   it("scopes reattached OOPIF reports to their owning conversation turn", async () => {
@@ -1217,11 +2971,14 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
 
     const listeners = new Map<string, (params: unknown, sessionId?: string) => void>();
+    const conversationRecordExpressions: string[] = [];
+    const runtimeEnabledSessions = new Set<string>();
     const deepResearchUrl =
       "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/";
     const mockClient = {
@@ -1250,10 +3007,51 @@ describe("waitForDeepResearchCompletion", () => {
           );
           return {};
         }
+        if (method === "Runtime.enable" && sessionId === "current-session") {
+          if (!runtimeEnabledSessions.has(sessionId)) {
+            runtimeEnabledSessions.add(sessionId);
+            listeners.get("Runtime.executionContextCreated")?.(
+              {
+                context: {
+                  id: 31,
+                  auxData: { frameId: "current-session-report-frame", isDefault: true },
+                },
+              },
+              "current-session",
+            );
+          }
+          return {};
+        }
+        if (method === "Runtime.disable" && sessionId) {
+          runtimeEnabledSessions.delete(sessionId);
+          return {};
+        }
         if (method === "Page.getFrameTree") {
           return {
-            frameTree: { frame: { id: `${sessionId}-frame`, name: "root", url: deepResearchUrl } },
+            frameTree:
+              sessionId === "current-session"
+                ? {
+                    frame: {
+                      id: "current-session-frame",
+                      name: "sandbox",
+                      url: deepResearchUrl,
+                    },
+                    childFrames: [
+                      {
+                        frame: {
+                          id: "current-session-report-frame",
+                          name: "root",
+                          url: deepResearchUrl,
+                        },
+                      },
+                    ],
+                  }
+                : { frame: { id: `${sessionId}-frame`, name: "root", url: deepResearchUrl } },
           };
+        }
+        if (method === "Page.createIsolatedWorld" && sessionId === "current-session") {
+          const frameId = (params as { frameId?: string }).frameId;
+          return { executionContextId: frameId === "current-session-report-frame" ? 42 : 41 };
         }
         if (method === "DOM.getFrameOwner") {
           const frameId = (params as { frameId?: string }).frameId;
@@ -1265,9 +3063,74 @@ describe("waitForDeepResearchCompletion", () => {
         }
         if (method === "Runtime.callFunctionOn" && sessionId === "page-session") {
           const objectId = (params as { objectId?: string }).objectId;
-          return { result: { value: objectId === "current-owner" ? 2 : 0 } };
+          return {
+            result: {
+              value:
+                objectId === "current-owner"
+                  ? {
+                      messageId: "message-current",
+                      turnId: "conversation-turn-3",
+                      turnIndex: 2,
+                      modelSlug: "gpt-5-6-pro",
+                    }
+                  : {
+                      messageId: "message-old",
+                      turnId: "conversation-turn-1",
+                      turnIndex: 0,
+                      modelSlug: "gpt-4o",
+                    },
+            },
+          };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          sessionId === "page-session" &&
+          String((params as { expression?: string })?.expression).includes(
+            "oracle-deep-research-conversation-record-metadata",
+          )
+        ) {
+          conversationRecordExpressions.push(
+            String((params as { expression?: string })?.expression),
+          );
+          return {
+            result: {
+              value: {
+                messageId: "message-current",
+                finalMessageId: "message-current-final",
+                modelSlug: "gpt-5-5-instant",
+                resolvedModelSlug: "gpt-5-5-instant",
+                defaultModelSlug: "gpt-5-6-pro",
+                deepResearchVersion: "standard",
+                metadataSource: "chatgpt-conversation-record",
+              },
+            },
+          };
         }
         if (method === "Runtime.evaluate" && sessionId) {
+          if (
+            String((params as { expression?: string })?.expression).includes(
+              "oracle-deep-research-citation-sources",
+            )
+          ) {
+            return {
+              result: {
+                value: {
+                  observedIndexes: [1],
+                  sources: [{ index: 1, url: "https://example.com/current-source" }],
+                },
+              },
+            };
+          }
+          if (
+            sessionId === "current-session" &&
+            (params as { contextId?: number }).contextId === 41
+          ) {
+            return {
+              result: {
+                value: { completed: false, inProgress: false, textLength: 0 },
+              },
+            };
+          }
           return {
             result: {
               value: {
@@ -1276,8 +3139,11 @@ describe("waitForDeepResearchCompletion", () => {
                 textLength: 80,
                 text:
                   sessionId === "current-session"
-                    ? "CURRENT_REPORT https://example.com/current"
+                    ? `CURRENT_REPORT[[ORACLE_DEEP_RESEARCH_CITATION_${TEST_CITATION_NONCE}_1]] https://example.com/current`
                     : "OLD_REPORT https://example.com/old",
+                citationMarkerNonce: TEST_CITATION_NONCE,
+                citationRootComparable: "current report root",
+                citationReportNeedle: "current report",
               },
             },
           };
@@ -1293,15 +3159,94 @@ describe("waitForDeepResearchCompletion", () => {
       1,
       undefined,
       mockClient as never,
-      { requireScopedTargetOwner: true },
+      {
+        requireScopedTargetOwner: true,
+        expectedConversationId: "conversation-id",
+        expectedUserMessageId: "user-message-current",
+      },
     );
 
-    expect(result.text).toBe("CURRENT_REPORT https://example.com/current");
+    expect(result.text).toBe(
+      "CURRENT_REPORT[1](<https://example.com/current-source>) https://example.com/current",
+    );
+    expect(result.citationStatus).toEqual({ total: 1, linked: 1, missingIndexes: [] });
+    expect(result.meta).toEqual({
+      messageId: "message-current",
+      turnId: "conversation-turn-3",
+      turnIndex: 2,
+      modelSlug: "gpt-5-5-instant",
+      finalMessageId: "message-current-final",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record",
+    });
+    expect(result.assistantTurn).toMatchObject({
+      messageId: "message-current",
+      turnId: "conversation-turn-3",
+      turnIndex: 2,
+      modelSlug: "gpt-5-5-instant",
+      finalMessageId: "message-current-final",
+      resolvedModelSlug: "gpt-5-5-instant",
+      defaultModelSlug: "gpt-5-6-pro",
+      deepResearchVersion: "standard",
+      metadataSource: "chatgpt-conversation-record",
+      responseSha256: createHash("sha256")
+        .update(
+          "CURRENT_REPORT[1](<https://example.com/current-source>) https://example.com/current",
+        )
+        .digest("hex"),
+    });
     expect(mockClient.send).toHaveBeenCalledWith(
       "DOM.getFrameOwner",
       { frameId: "current-session-frame" },
       "page-session",
     );
+    const ownerMetadataCall = mockClient.send.mock.calls.find(
+      ([method, , sessionId]) =>
+        method === "Runtime.callFunctionOn" && sessionId === "page-session",
+    );
+    const ownerFunction = String(
+      (ownerMetadataCall?.[1] as { functionDeclaration?: string } | undefined)?.functionDeclaration,
+    );
+    expect(ownerFunction.indexOf("turn.getAttribute?.('data-turn-id')")).toBeGreaterThanOrEqual(0);
+    expect(ownerFunction.indexOf("turn.getAttribute?.('data-turn-id')")).toBeLessThan(
+      ownerFunction.indexOf("messageRoot.getAttribute?.('data-turn-id')"),
+    );
+    expect(ownerFunction.indexOf("turn.getAttribute?.('data-turn-id')")).toBeLessThan(
+      ownerFunction.indexOf("messageRoot.getAttribute?.('data-message-id')"),
+    );
+    expect(ownerFunction.indexOf("turn.getAttribute?.('data-turn-id-container')")).toBeLessThan(
+      ownerFunction.indexOf("messageRoot.getAttribute?.('data-message-id')"),
+    );
+    expect(ownerFunction).toContain("!/^request-web:/i.test(candidate)");
+    expect(ownerFunction).toContain("!/^conversation-turn-\\d+$/i.test(candidate)");
+    expect(ownerFunction).toContain("if (!messageRoot) return null");
+    expect(conversationRecordExpressions).toHaveLength(2);
+    expect(conversationRecordExpressions[0]).toContain(
+      'const expectedMessageId = "message-current"',
+    );
+    expect(conversationRecordExpressions[0]).toContain(
+      'const expectedUserMessageId = "user-message-current"',
+    );
+    expect(conversationRecordExpressions).toEqual(
+      conversationRecordExpressions.filter((expression) =>
+        expression.includes('const expectedMessageId = "message-current"'),
+      ),
+    );
+    const citationCalls = mockClient.send.mock.calls.filter(
+      ([method, params, sessionId]) =>
+        method === "Runtime.evaluate" &&
+        sessionId === "current-session" &&
+        String((params as { expression?: string })?.expression).includes(
+          "oracle-deep-research-citation-sources",
+        ),
+    );
+    expect(citationCalls).toHaveLength(2);
+    expect(
+      citationCalls.every(([, params]) => (params as { contextId?: number }).contextId === 31),
+    ).toBe(true);
+    expect(mockClient.send).toHaveBeenCalledWith("Runtime.disable", {}, "current-session");
   });
 
   it("prefers a completed page target over an earlier in-progress one", async () => {
@@ -1316,6 +3261,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -1352,7 +3298,33 @@ describe("waitForDeepResearchCompletion", () => {
         }
         if (method === "DOM.getFrameOwner") return { backendNodeId: 7 };
         if (method === "DOM.resolveNode") return { object: { objectId: "current-owner" } };
-        if (method === "Runtime.callFunctionOn") return { result: { value: 1 } };
+        if (method === "Runtime.callFunctionOn") {
+          return {
+            result: {
+              value: { messageId: "message-current", turnIndex: 1 },
+            },
+          };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          String((params as { expression?: string })?.expression).includes(
+            "oracle-deep-research-conversation-record-metadata",
+          )
+        ) {
+          return {
+            result: {
+              value: {
+                messageId: "message-current",
+                finalMessageId: "message-current-final",
+                modelSlug: "gpt-5-5-instant",
+                resolvedModelSlug: "gpt-5-5-instant",
+                defaultModelSlug: "gpt-5-6-pro",
+                deepResearchVersion: "standard",
+                metadataSource: "chatgpt-conversation-record",
+              },
+            },
+          };
+        }
         if (method === "Runtime.evaluate" && sessionId === "complete-session") {
           return {
             result: {
@@ -1391,6 +3363,10 @@ describe("waitForDeepResearchCompletion", () => {
         1,
         undefined,
         mockClient as never,
+        {
+          expectedConversationId: "conversation-id",
+          expectedUserMessageId: "user-message",
+        },
       );
       expect(result.text).toBe("REPORT_OK https://example.com/report");
     } finally {
@@ -1410,6 +3386,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -1441,7 +3418,33 @@ describe("waitForDeepResearchCompletion", () => {
         }
         if (method === "DOM.getFrameOwner") return { backendNodeId: 7 };
         if (method === "DOM.resolveNode") return { object: { objectId: "current-owner" } };
-        if (method === "Runtime.callFunctionOn") return { result: { value: 1 } };
+        if (method === "Runtime.callFunctionOn") {
+          return {
+            result: {
+              value: { messageId: "message-current", turnIndex: 1 },
+            },
+          };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          String((params as { expression?: string })?.expression).includes(
+            "oracle-deep-research-conversation-record-metadata",
+          )
+        ) {
+          return {
+            result: {
+              value: {
+                messageId: "message-current",
+                finalMessageId: "message-current-final",
+                modelSlug: "gpt-5-5-instant",
+                resolvedModelSlug: "gpt-5-5-instant",
+                defaultModelSlug: "gpt-5-6-pro",
+                deepResearchVersion: "standard",
+                metadataSource: "chatgpt-conversation-record",
+              },
+            },
+          };
+        }
         if (method === "Runtime.evaluate" && sessionId === "complete-session") {
           return {
             result: {
@@ -1468,6 +3471,10 @@ describe("waitForDeepResearchCompletion", () => {
       1,
       undefined,
       mockClient as never,
+      {
+        expectedConversationId: "conversation-id",
+        expectedUserMessageId: "user-message",
+      },
     );
 
     expect(result.text).toBe("REPORT_OK https://example.com/report");
@@ -1569,15 +3576,15 @@ describe("waitForDeepResearchCompletion", () => {
     }
   });
 
-  it("returns a fresh OOPIF report when the main DOM has no assistant turn", async () => {
+  it("returns a scoped report when ChatGPT reuses the pre-submission OOPIF target", async () => {
     // Regression: ChatGPT renders the Deep Research report inside an
     // out-of-process iframe that is invisible to the main page's frame tree.
     // The main-DOM poll therefore shows no assistant turn and
     // hasActiveScopedResearch=false, while the target-attach path reads the
-    // completed report directly. Both Page and client are passed (production
-    // shape), the run is scoped (minTurnIndex>=0), and the pre-submit target
-    // baseline is present. The target-confirmed completion must be returned
-    // without requiring frame-owner resolution, which OOPIFs may not support.
+    // completed report directly. ChatGPT may create this OOPIF as soon as Deep
+    // Research is selected, so its target id can already be in the pre-submit
+    // baseline. The target must be reconsidered, but only the successful
+    // current-turn owner lookup may authorize returning its report.
     mockRuntime.evaluate.mockResolvedValue({
       result: {
         value: {
@@ -1586,6 +3593,7 @@ describe("waitForDeepResearchCompletion", () => {
           textLength: 0,
           hasIframe: true,
           hasActiveScopedResearch: false,
+          conversationId: "conversation-id",
         },
       },
     });
@@ -1601,6 +3609,7 @@ describe("waitForDeepResearchCompletion", () => {
           listeners.get("Target.attachedToTarget")?.({
             sessionId: "deep-session",
             targetInfo: {
+              targetId: "reused-deep-target",
               type: "iframe",
               url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
             },
@@ -1636,7 +3645,38 @@ describe("waitForDeepResearchCompletion", () => {
         }
         if (method === "DOM.getFrameOwner") return { backendNodeId: 7 };
         if (method === "DOM.resolveNode") return { object: { objectId: "current-owner" } };
-        if (method === "Runtime.callFunctionOn") return { result: { value: 1 } };
+        if (method === "Runtime.callFunctionOn") {
+          return {
+            result: {
+              value: {
+                messageId: "message-deep",
+                turnId: "conversation-turn-2",
+                turnIndex: 1,
+                modelSlug: "gpt-5-6-pro",
+              },
+            },
+          };
+        }
+        if (
+          method === "Runtime.evaluate" &&
+          (params as { expression?: string }).expression?.includes(
+            "oracle-deep-research-conversation-record-metadata",
+          )
+        ) {
+          return {
+            result: {
+              value: {
+                messageId: "message-deep",
+                finalMessageId: "final-message-deep",
+                modelSlug: "gpt-5-5-instant",
+                resolvedModelSlug: "gpt-5-5-instant",
+                defaultModelSlug: "gpt-5-6-pro",
+                deepResearchVersion: "standard",
+                metadataSource: "chatgpt-conversation-record",
+              },
+            },
+          };
+        }
         if (
           method === "Runtime.evaluate" &&
           sessionId === "deep-session" &&
@@ -1676,11 +3716,25 @@ describe("waitForDeepResearchCompletion", () => {
       1,
       mockPage as never,
       mockClient as never,
-      { ignoredTargetKeys: [], targetBaselineCaptured: true },
+      {
+        targetBaseline: [{ targetId: "reused-deep-target", completed: false }],
+        targetBaselineCaptured: true,
+        expectedConversationId: "conversation-id",
+        expectedUserMessageId: "user-message",
+      },
     );
 
     expect(result.text).toBe("OOPIF_REPORT https://example.com/report");
-    expect(mockClient.send).not.toHaveBeenCalledWith(
+    expect(result.assistantTurn).toMatchObject({
+      messageId: "message-deep",
+      turnId: "conversation-turn-2",
+      turnIndex: 1,
+      modelSlug: "gpt-5-5-instant",
+      responseSha256: createHash("sha256")
+        .update("OOPIF_REPORT https://example.com/report")
+        .digest("hex"),
+    });
+    expect(mockClient.send).toHaveBeenCalledWith(
       "DOM.getFrameOwner",
       { frameId: "sandbox" },
       undefined,
@@ -1703,7 +3757,13 @@ describe("waitForDeepResearchCompletion", () => {
       }
       return {
         result: {
-          value: { finished: false, stopVisible: false, textLength: 0, hasIframe: true },
+          value: {
+            finished: false,
+            stopVisible: false,
+            textLength: 0,
+            hasIframe: true,
+            conversationId: "conversation-id",
+          },
         },
       };
     });
@@ -1739,6 +3799,10 @@ describe("waitForDeepResearchCompletion", () => {
           1,
           mockPage as never,
           mockClient as never,
+          {
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
         ),
       ).rejects.toThrow(/did not complete/);
       expect(mockPage.createIsolatedWorld).not.toHaveBeenCalled();
@@ -1747,7 +3811,7 @@ describe("waitForDeepResearchCompletion", () => {
     }
   });
 
-  it("accepts a frame result during a scoped run after a fresh Deep Research turn appears", async () => {
+  it("fails closed instead of using the legacy frame fallback during a scoped run", async () => {
     mockRuntime.evaluate.mockImplementation(async (params?: { contextId?: number }) => {
       if (typeof params?.contextId === "number") {
         return {
@@ -1769,6 +3833,7 @@ describe("waitForDeepResearchCompletion", () => {
             textLength: 0,
             hasIframe: true,
             hasActiveScopedResearch: true,
+            conversationId: "conversation-id",
           },
         },
       };
@@ -1796,23 +3861,35 @@ describe("waitForDeepResearchCompletion", () => {
       createIsolatedWorld: vi.fn().mockResolvedValue({ executionContextId: 42 }),
     };
     const mockClient = createFrameOwnerClient((frameId) =>
-      frameId === "fresh-deep-frame" ? 1 : 0,
+      frameId === "fresh-deep-frame"
+        ? { messageId: "message-fresh", turnIndex: 1 }
+        : { messageId: "message-old", turnIndex: 0 },
     );
 
-    const result = await waitForDeepResearchCompletion(
-      mockRuntime as never,
-      mockLogger,
-      60_000,
-      1,
-      mockPage as never,
-      mockClient as never,
-    );
-
-    expect(result.text).toBe("FRESH_REPORT https://example.com/report");
-    expect(mockPage.createIsolatedWorld).toHaveBeenCalledTimes(1);
-    expect(mockPage.createIsolatedWorld).toHaveBeenCalledWith(
-      expect.objectContaining({ frameId: "fresh-deep-frame" }),
-    );
+    let nowCalls = 0;
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      nowCalls += 1;
+      return nowCalls < 8 ? 1_000 : 2_000;
+    });
+    try {
+      await expect(
+        waitForDeepResearchCompletion(
+          mockRuntime as never,
+          mockLogger,
+          100,
+          1,
+          mockPage as never,
+          mockClient as never,
+          {
+            expectedConversationId: "conversation-id",
+            expectedUserMessageId: "user-message",
+          },
+        ),
+      ).rejects.toThrow(/did not complete/);
+      expect(mockPage.createIsolatedWorld).not.toHaveBeenCalled();
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 
   it("does not fall back to an older completed turn when scoped to new turns", () => {
@@ -1837,6 +3914,91 @@ describe("waitForDeepResearchCompletion", () => {
     expect(result.finished).toBe(false);
     expect(result.textLength).toBe(0);
     expect(result.isToolStub).toBe(false);
+  });
+
+  it("fails before polling when the pre-submission target baseline was unavailable", async () => {
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        undefined,
+        { targetBaselineCaptured: false },
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "deep-research-target-baseline-unavailable" },
+    });
+    expect(mockRuntime.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("fails before polling when a scoped run has no pinned conversation ID", async () => {
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        undefined,
+        { targetBaselineCaptured: true },
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "deep-research-conversation-unavailable" },
+    });
+    expect(mockRuntime.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("fails before polling when a scoped run lacks the exact submitted user message ID", async () => {
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        undefined,
+        {
+          targetBaselineCaptured: true,
+          expectedConversationId: "conversation-id",
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "deep-research-user-turn-unavailable" },
+    });
+    expect(mockRuntime.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the page leaves the pinned Deep Research conversation", async () => {
+    mockRuntime.evaluate.mockResolvedValue({
+      result: {
+        value: {
+          finished: false,
+          stopVisible: false,
+          textLength: 0,
+          conversationId: "conversation-b",
+        },
+      },
+    });
+
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        undefined,
+        {
+          targetBaselineCaptured: true,
+          expectedConversationId: "conversation-a",
+          expectedUserMessageId: "user-message",
+        },
+      ),
+    ).rejects.toMatchObject({
+      details: { code: "deep-research-conversation-changed" },
+    });
   });
 
   it("throws on timeout with metadata", async () => {

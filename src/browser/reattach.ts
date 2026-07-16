@@ -2,7 +2,12 @@ import CDP from "chrome-remote-interface";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
-import type { BrowserRuntimeMetadata, BrowserSessionConfig } from "../sessionStore.js";
+import type {
+  BrowserAssistantTurnEvidence,
+  BrowserRunWarning,
+  BrowserRuntimeMetadata,
+  BrowserSessionConfig,
+} from "../sessionStore.js";
 import {
   waitForAssistantResponse,
   captureAssistantMarkdown,
@@ -11,7 +16,7 @@ import {
   ensureLoggedIn,
   ensurePromptReady,
 } from "./pageActions.js";
-import type { BrowserLogger, ChromeClient } from "./types.js";
+import type { BrowserArchiveResult, BrowserLogger, ChromeClient } from "./types.js";
 import {
   launchChrome,
   connectToChrome,
@@ -40,6 +45,14 @@ import {
   type TargetInfoLite,
 } from "./reattachHelpers.js";
 import { waitForDeepResearchCompletion } from "./actions/deepResearch.js";
+import {
+  buildDeepResearchAnswerFields,
+  type DeepResearchAnswerFields,
+} from "./deepResearchAnswer.js";
+import {
+  archiveChatGptConversation,
+  resolveBrowserArchiveDecision,
+} from "./actions/archiveConversation.js";
 
 export interface ReattachDeps {
   listTargets?: () => Promise<TargetInfoLite[]>;
@@ -51,12 +64,23 @@ export interface ReattachDeps {
     runtime: BrowserRuntimeMetadata,
     config: BrowserSessionConfig | undefined,
   ) => Promise<ReattachResult>;
+  /**
+   * Persist the captured answer while the exact conversation is still open.
+   * Return true only after every required local artifact has been saved; this
+   * gates any configured post-capture archive action.
+   */
+  persistResultBeforeClose?: (result: ReattachResult) => Promise<boolean>;
   promptPreview?: string;
 }
 
 export interface ReattachResult {
   answerText: string;
   answerMarkdown: string;
+  answerHtml?: string;
+  assistantTurn?: BrowserAssistantTurnEvidence;
+  citationStatus?: DeepResearchAnswerFields["citationStatus"];
+  warnings?: BrowserRunWarning[];
+  archive?: BrowserArchiveResult;
 }
 
 export async function resumeBrowserSession(
@@ -126,6 +150,25 @@ export async function resumeBrowserSession(
 
     const client: ChromeClient = connection.client;
     const { Runtime, DOM, Page } = client;
+    const expectedConversationId =
+      runtime.conversationId ??
+      extractConversationIdFromUrl(runtime.tabUrl ?? "") ??
+      extractConversationIdFromUrl(config?.url ?? "");
+    const finishAttachedCapture = async (result: ReattachResult): Promise<ReattachResult> => {
+      try {
+        return await finalizeReattachCapture({
+          result,
+          Runtime,
+          runtime,
+          config,
+          expectedConversationId,
+          logger,
+          persistResultBeforeClose: deps.persistResultBeforeClose,
+        });
+      } finally {
+        await closeAttached();
+      }
+    };
     if (Runtime?.enable) {
       await Runtime.enable();
     }
@@ -144,15 +187,14 @@ export async function resumeBrowserSession(
       const href = typeof result?.value === "string" ? result.value : "";
       if (href.includes("/c/")) {
         const currentId = extractConversationIdFromUrl(href);
-        if (!runtime.conversationId || (currentId && currentId === runtime.conversationId)) {
+        if (!expectedConversationId || (currentId && currentId === expectedConversationId)) {
           return;
         }
       }
       const opened = await openConversationFromSidebarWithRetry(
         Runtime,
         {
-          conversationId:
-            runtime.conversationId ?? extractConversationIdFromUrl(runtime.tabUrl ?? ""),
+          conversationId: expectedConversationId,
           preferProjects: true,
           promptPreview: deps.promptPreview,
         },
@@ -175,23 +217,39 @@ export async function resumeBrowserSession(
     );
     await ensureConversationOpen();
     const minTurnIndex =
-      (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
-      (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+      config?.researchMode === "deep"
+        ? null
+        : await readReattachMinTurnIndex(Runtime, deps.promptPreview, logger);
     if (config?.researchMode === "deep") {
+      if (!expectedConversationId) {
+        throw new Error(
+          "Unable to establish the saved conversation ID for Deep Research reattach.",
+        );
+      }
+      await requirePinnedConversation(Runtime, expectedConversationId);
+      const submittedUserMessageId = runtime.submittedUserMessageId?.trim();
+      const submittedUserTurnIndex = runtime.submittedUserTurnIndex;
+      if (
+        !submittedUserMessageId ||
+        typeof submittedUserTurnIndex !== "number" ||
+        submittedUserTurnIndex < 0
+      ) {
+        throw new Error(
+          "Deep Research reattach lacks the persisted exact submitted user turn; refusing prompt-based reconstruction.",
+        );
+      }
       const waitForDeepResearch =
         deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
       const researchResult = await withTimeout(
-        waitForDeepResearch(Runtime, logger, timeoutMs, minTurnIndex ?? undefined, Page, client, {
+        waitForDeepResearch(Runtime, logger, timeoutMs, submittedUserTurnIndex, Page, client, {
           requireScopedTargetOwner: true,
+          expectedConversationId,
+          expectedUserMessageId: submittedUserMessageId,
         }),
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
-      await closeAttached();
-      return {
-        answerText: researchResult.text,
-        answerMarkdown: researchResult.text,
-      };
+      return finishAttachedCapture(buildDeepResearchAnswerFields(researchResult));
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const answer = await withTimeout(
@@ -215,8 +273,10 @@ export async function resumeBrowserSession(
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
-    await closeAttached();
-    return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
+    return finishAttachedCapture({
+      answerText: aligned.answerText,
+      answerMarkdown: aligned.answerMarkdown,
+    });
   } catch (error) {
     await closeAttached();
     const message = error instanceof Error ? error.message : String(error);
@@ -321,6 +381,10 @@ async function resumeBrowserSessionViaNewChrome(
   await ensurePromptReady(Runtime, resolved.inputTimeoutMs, logger);
 
   const conversationUrl = buildConversationUrl(runtime, resolved.url);
+  const expectedConversationId =
+    runtime.conversationId ??
+    extractConversationIdFromUrl(runtime.tabUrl ?? "") ??
+    extractConversationIdFromUrl(resolved.url);
   if (conversationUrl) {
     logger(`Reopening conversation at ${conversationUrl}`);
     await navigateToChatGPT(Page, Runtime, conversationUrl, logger);
@@ -373,27 +437,63 @@ async function resumeBrowserSessionViaNewChrome(
       }
     }
   };
+  const finishRecoveredCapture = async (result: ReattachResult): Promise<ReattachResult> => {
+    try {
+      return await finalizeReattachCapture({
+        result,
+        Runtime,
+        runtime,
+        config: resolved,
+        expectedConversationId,
+        logger,
+        persistResultBeforeClose: deps.persistResultBeforeClose,
+      });
+    } finally {
+      await cleanup();
+    }
+  };
   const minTurnIndex =
-    (await readPromptPreviewTurnIndex(Runtime, deps.promptPreview)) ??
-    (deps.promptPreview ? null : await readConversationTurnIndex(Runtime, logger));
+    resolved.researchMode === "deep"
+      ? null
+      : await readReattachMinTurnIndex(Runtime, deps.promptPreview, logger);
   if (resolved.researchMode === "deep") {
+    if (!expectedConversationId) {
+      await cleanup();
+      throw new Error("Unable to establish the saved conversation ID for Deep Research reattach.");
+    }
+    try {
+      await requirePinnedConversation(Runtime, expectedConversationId);
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
+    const submittedUserMessageId = runtime.submittedUserMessageId?.trim();
+    const submittedUserTurnIndex = runtime.submittedUserTurnIndex;
+    if (
+      !submittedUserMessageId ||
+      typeof submittedUserTurnIndex !== "number" ||
+      submittedUserTurnIndex < 0
+    ) {
+      await cleanup();
+      throw new Error(
+        "Deep Research reattach lacks the persisted exact submitted user turn; refusing prompt-based reconstruction.",
+      );
+    }
     const waitForDeepResearch = deps.waitForDeepResearchCompletion ?? waitForDeepResearchCompletion;
     const researchResult = await waitForDeepResearch(
       Runtime,
       logger,
       timeoutMs,
-      minTurnIndex ?? undefined,
+      submittedUserTurnIndex,
       Page,
       client,
       {
         requireScopedTargetOwner: true,
+        expectedConversationId,
+        expectedUserMessageId: submittedUserMessageId,
       },
     );
-    await cleanup();
-    return {
-      answerText: researchResult.text,
-      answerMarkdown: researchResult.text,
-    };
+    return finishRecoveredCapture(buildDeepResearchAnswerFields(researchResult));
   }
   const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
   const answer = await waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined);
@@ -408,9 +508,10 @@ async function resumeBrowserSessionViaNewChrome(
   const markdown = (await captureMarkdown(Runtime, recovered.meta, logger)) ?? recovered.text;
   const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
-  await cleanup();
-
-  return { answerText: aligned.answerText, answerMarkdown: aligned.answerMarkdown };
+  return finishRecoveredCapture({
+    answerText: aligned.answerText,
+    answerMarkdown: aligned.answerMarkdown,
+  });
 }
 
 async function readPromptPreviewTurnIndex(
@@ -444,6 +545,148 @@ async function readPromptPreviewTurnIndex(
   return typeof result?.value === "number" ? result.value : null;
 }
 
+async function requirePinnedConversation(
+  Runtime: ChromeClient["Runtime"],
+  expectedConversationId: string,
+): Promise<void> {
+  const { result } = await Runtime.evaluate({
+    expression: "location.href",
+    returnByValue: true,
+  });
+  const href = typeof result?.value === "string" ? result.value : "";
+  const currentConversationId = extractConversationIdFromUrl(href);
+  if (currentConversationId !== expectedConversationId) {
+    throw new Error(
+      "ChatGPT is not showing the saved Deep Research conversation; refusing an unpinned reattach.",
+    );
+  }
+}
+
+async function readReattachMinTurnIndex(
+  Runtime: ChromeClient["Runtime"],
+  promptPreview: string | null | undefined,
+  logger: BrowserLogger,
+): Promise<number | null> {
+  return (
+    (await readPromptPreviewTurnIndex(Runtime, promptPreview)) ??
+    (await readConversationTurnIndex(Runtime, logger))
+  );
+}
+
+async function finalizeReattachCapture({
+  result,
+  Runtime,
+  runtime,
+  config,
+  expectedConversationId,
+  logger,
+  persistResultBeforeClose,
+}: {
+  result: ReattachResult;
+  Runtime: ChromeClient["Runtime"];
+  runtime: BrowserRuntimeMetadata;
+  config: BrowserSessionConfig | undefined;
+  expectedConversationId?: string;
+  logger: BrowserLogger;
+  persistResultBeforeClose?: ReattachDeps["persistResultBeforeClose"];
+}): Promise<ReattachResult> {
+  if (!persistResultBeforeClose) return result;
+
+  const requiredArtifactsSaved = await persistResultBeforeClose(result);
+  const mode = config?.archiveConversations ?? "auto";
+  // Reattach does not persist enough turn history to safely re-evaluate the
+  // automatic one-shot/multi-turn policy. Honor only the user's explicit
+  // archive=always request here; never guess that an auto session is one-shot.
+  if (mode !== "always") return result;
+  const evaluatedUrl = await Runtime.evaluate({
+    expression: "location.href",
+    returnByValue: true,
+  })
+    .then(({ result: evaluated }) =>
+      typeof evaluated?.value === "string" ? evaluated.value : undefined,
+    )
+    .catch(() => undefined);
+  const conversationUrl = evaluatedUrl ?? runtime.tabUrl;
+  const decision = resolveBrowserArchiveDecision({
+    mode,
+    chatgptUrl: config?.url,
+    conversationUrl,
+    researchMode: config?.researchMode,
+    followUpCount: 0,
+  });
+  if (!decision.shouldArchive) {
+    logger(`[browser] ChatGPT archive skipped (${decision.reason}).`);
+    return {
+      ...result,
+      archive: {
+        mode: decision.mode,
+        attempted: false,
+        archived: false,
+        reason: decision.reason,
+        conversationUrl,
+      },
+    };
+  }
+  if (!requiredArtifactsSaved) {
+    logger("[browser] ChatGPT archive skipped (artifact-save-failed).");
+    return {
+      ...result,
+      archive: {
+        mode: decision.mode,
+        attempted: false,
+        archived: false,
+        reason: "artifact-save-failed",
+        conversationUrl,
+      },
+    };
+  }
+  const pinnedConversationId = expectedConversationId?.trim();
+  if (!pinnedConversationId) {
+    logger("[browser] ChatGPT archive skipped (missing-conversation-id).");
+    return {
+      ...result,
+      archive: {
+        mode: decision.mode,
+        attempted: false,
+        archived: false,
+        reason: "missing-conversation-id",
+        conversationUrl,
+      },
+    };
+  }
+  if (extractConversationIdFromUrl(conversationUrl ?? "") !== pinnedConversationId) {
+    logger("[browser] ChatGPT archive skipped (conversation-changed).");
+    return {
+      ...result,
+      archive: {
+        mode: decision.mode,
+        attempted: false,
+        archived: false,
+        reason: "conversation-changed",
+        conversationUrl,
+      },
+    };
+  }
+
+  const archive = await archiveChatGptConversation(Runtime, logger, {
+    mode: decision.mode,
+    conversationUrl,
+    expectedConversationId: pinnedConversationId,
+  }).catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`[browser] ChatGPT archive failed (${message}).`);
+    return {
+      mode: decision.mode,
+      attempted: true,
+      archived: false,
+      reason: "archive-failed",
+      conversationUrl,
+      error: message,
+    } satisfies BrowserArchiveResult;
+  });
+  return { ...result, archive };
+}
+
 // biome-ignore lint/style/useNamingConvention: test-only export used in vitest suite
 export const __test__ = {
   pickTarget,
@@ -451,4 +694,6 @@ export const __test__ = {
   buildConversationUrl,
   openConversationFromSidebar,
   readPromptPreviewTurnIndex,
+  readReattachMinTurnIndex,
+  requirePinnedConversation,
 };
