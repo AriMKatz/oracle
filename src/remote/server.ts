@@ -245,6 +245,8 @@ export async function createRemoteServer(
           path: filePath,
           displayPath: attachment.displayPath,
           sizeBytes: attachment.sizeBytes,
+          generatedBundle: attachment.generatedBundle,
+          sourcePaths: attachment.sourcePaths,
         });
       }
 
@@ -263,6 +265,8 @@ export async function createRemoteServer(
             path: filePath,
             displayPath: attachment.displayPath,
             sizeBytes: attachment.sizeBytes,
+            generatedBundle: attachment.generatedBundle,
+            sourcePaths: attachment.sourcePaths,
           });
         }
         fallbackSubmission = {

@@ -9,6 +9,11 @@ export interface ZipBundleEntry {
   content: string | Buffer;
 }
 
+export interface StoredZipBundle {
+  buffer: Buffer;
+  entryPaths: string[];
+}
+
 interface PreparedZipEntry {
   name: Buffer;
   content: Buffer;
@@ -129,7 +134,7 @@ function endOfCentralDirectory(
   return footer;
 }
 
-export function createStoredZip(entries: ZipBundleEntry[]): Buffer {
+export function createStoredZipWithManifest(entries: ZipBundleEntry[]): StoredZipBundle {
   if (entries.length > 0xffff) {
     throw new Error("Too many files for a ZIP32 browser bundle.");
   }
@@ -172,7 +177,14 @@ export function createStoredZip(entries: ZipBundleEntry[]): Buffer {
   assertZip32(centralOffset, "ZIP central directory offset");
   assertZip32(centralSize, "ZIP central directory size");
   const footer = endOfCentralDirectory(prepared.length, centralSize, centralOffset);
-  return Buffer.concat([...localParts, ...centralParts, footer]);
+  return {
+    buffer: Buffer.concat([...localParts, ...centralParts, footer]),
+    entryPaths: prepared.map((entry) => entry.name.toString("utf8")),
+  };
+}
+
+export function createStoredZip(entries: ZipBundleEntry[]): Buffer {
+  return createStoredZipWithManifest(entries).buffer;
 }
 
 export const __test__ = {

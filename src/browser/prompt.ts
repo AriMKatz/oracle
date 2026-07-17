@@ -14,7 +14,7 @@ import { isKnownModel } from "../oracle/modelResolver.js";
 import { buildPromptMarkdown } from "../oracle/promptAssembly.js";
 import type { BrowserAttachment } from "./types.js";
 import { buildAttachmentPlan } from "./policies.js";
-import { createStoredZip } from "./zipBundle.js";
+import { createStoredZipWithManifest } from "./zipBundle.js";
 
 const DEFAULT_BROWSER_INLINE_CHAR_BUDGET = 60_000;
 const MAX_BROWSER_ATTACHMENTS = 10;
@@ -211,7 +211,7 @@ async function writeBrowserBundle(
       );
     }
     const bundlePath = path.join(bundleDir, "attachments-bundle.zip");
-    const buffer = createStoredZip(
+    const bundle = createStoredZipWithManifest(
       await Promise.all(
         sources.map(async (source) => ({
           path: source.displayPath,
@@ -219,13 +219,14 @@ async function writeBrowserBundle(
         })),
       ),
     );
-    await fs.writeFile(bundlePath, buffer);
+    await fs.writeFile(bundlePath, bundle.buffer);
     return {
       attachment: {
         path: bundlePath,
         displayPath: bundlePath,
-        sizeBytes: buffer.length,
+        sizeBytes: bundle.buffer.length,
         generatedBundle: true,
+        sourcePaths: bundle.entryPaths,
       },
       metadata: { originalCount: sources.length, bundlePath, format },
       tokenEstimateText,

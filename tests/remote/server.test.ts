@@ -177,6 +177,8 @@ describe("remote browser service", () => {
             }
             const stored = await readFile(attachment.path, "utf8");
             expect(stored).toBe("hello world");
+            expect(attachment.generatedBundle).toBe(true);
+            expect(attachment.sourcePaths).toEqual(["source/note.txt"]);
             expect(options.fallbackSubmission?.prompt).toBe("fallback prompt");
             expect(options.fallbackSubmission?.attachments).toHaveLength(1);
             const fallbackAttachment = options.fallbackSubmission?.attachments[0];
@@ -185,6 +187,8 @@ describe("remote browser service", () => {
             }
             const fallbackStored = await readFile(fallbackAttachment.path, "utf8");
             expect(fallbackStored).toBe("fallback world");
+            expect(fallbackAttachment.generatedBundle).toBe(true);
+            expect(fallbackAttachment.sourcePaths).toEqual(["source/fallback.txt"]);
             options.log?.("uploading attachment");
             const result: BrowserRunResult = {
               answerText: "hi",
@@ -255,11 +259,25 @@ describe("remote browser service", () => {
       const clientLogs: string[] = [];
       const result = await executor({
         prompt: "remote",
-        attachments: [{ path: attachmentPath, displayPath: "note.txt", sizeBytes: 11 }],
+        attachments: [
+          {
+            path: attachmentPath,
+            displayPath: "note.txt",
+            sizeBytes: 11,
+            generatedBundle: true,
+            sourcePaths: ["source/note.txt"],
+          },
+        ],
         fallbackSubmission: {
           prompt: "fallback prompt",
           attachments: [
-            { path: fallbackAttachmentPath, displayPath: "fallback.txt", sizeBytes: 14 },
+            {
+              path: fallbackAttachmentPath,
+              displayPath: "fallback.txt",
+              sizeBytes: 14,
+              generatedBundle: true,
+              sourcePaths: ["source/fallback.txt"],
+            },
           ],
         },
         config: {},

@@ -416,6 +416,217 @@ describe("collectChatGptFileArtifacts", () => {
     );
   });
 
+  test("does not classify citations to known bundled inputs as generated artifacts", async () => {
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({ result: { value: [] } }),
+    } as unknown as ChromeClient["Runtime"];
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({ cookies: [] }),
+    } as unknown as ChromeClient["Network"];
+    const logger = vi.fn();
+
+    const result = await collectChatGptFileArtifacts({
+      Runtime: runtime,
+      Network: network,
+      sessionId: "collect-session",
+      answerText:
+        "Evidence: [world](sandbox:/mnt/data/attachments_bundle6/integrated_longitudinal_world.v2.json) " +
+        "and [notes](sandbox:/mnt/data/attachments_bundle6/research/source_notes.md).",
+      submittedAttachments: [
+        {
+          path: "/tmp/attachments-bundle.zip",
+          displayPath: "/tmp/attachments-bundle.zip",
+          generatedBundle: true,
+          sourcePaths: ["integrated_longitudinal_world.v2.json", "research/source_notes.md"],
+        },
+      ],
+      logger,
+    });
+
+    expect(result).toEqual({ files: [], savedFiles: [], fileCount: 0 });
+    expect(runtime.evaluate).toHaveBeenCalledTimes(3);
+    expect(network.getCookies).not.toHaveBeenCalled();
+    expect(logger).toHaveBeenCalledWith(
+      "[browser] Ignored 2 failed downloadable link candidate(s) proven to point back to submitted inputs.",
+    );
+    expect(logger).not.toHaveBeenCalledWith(
+      expect.stringContaining("Auto-save for downloadable files failed"),
+    );
+    expect(logger).not.toHaveBeenCalledWith(
+      expect.stringContaining("bridge artifact-ready will not be emitted"),
+    );
+  });
+
+  test("preserves a successfully downloadable same-path rewrite as an output artifact", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-input-rewrite-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const rewritten = "rewritten,value\nrow,42\n";
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: [] } })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fsource.csv",
+              contentDisposition: null,
+              contentType: "text/csv",
+              base64: Buffer.from(rewritten).toString("base64"),
+            },
+          },
+        }),
+    } as unknown as ChromeClient["Runtime"];
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({ cookies: [] }),
+    } as unknown as ChromeClient["Network"];
+
+    const result = await collectChatGptFileArtifacts({
+      Runtime: runtime,
+      Network: network,
+      sessionId: "collect-session",
+      answerText: "[rewritten source](sandbox:/mnt/data/source.csv)",
+      submittedAttachments: [{ path: "/tmp/source.csv", displayPath: "source.csv", sizeBytes: 10 }],
+    });
+
+    expect(result.fileCount).toBe(1);
+    expect(result.files[0]?.filename).toBe("source.csv");
+    expect(result.savedFiles[0]?.filename).toBe("source.csv");
+    expect(await fs.readFile(result.savedFiles[0]!.path, "utf8")).toBe(rewritten);
+  });
+
+  test("keeps genuine outputs while filtering exact submitted-input references", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-mixed-files-"));
+    setOracleHomeDirOverrideForTest(tmpHome);
+    const generatedCsv = "name,value\nalpha,1\n";
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({ result: { value: [] } })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              ok: true,
+              status: 200,
+              statusText: "OK",
+              url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fgenerated.csv",
+              contentDisposition: null,
+              contentType: "text/csv",
+              base64: Buffer.from(generatedCsv).toString("base64"),
+            },
+          },
+        }),
+    } as unknown as ChromeClient["Runtime"];
+    const network = {
+      getCookies: vi.fn().mockResolvedValue({ cookies: [] }),
+    } as unknown as ChromeClient["Network"];
+
+    const result = await collectChatGptFileArtifacts({
+      Runtime: runtime,
+      Network: network,
+      sessionId: "collect-session",
+      answerText:
+        "[input](sandbox:/mnt/data/attachments_bundle6/projects/source.md) " +
+        "[output](sandbox:/mnt/data/generated.csv)",
+      submittedAttachments: [
+        {
+          path: "/tmp/attachments-bundle.zip",
+          displayPath: "/tmp/attachments-bundle.zip",
+          generatedBundle: true,
+          sourcePaths: ["projects/source.md"],
+        },
+      ],
+    });
+
+    expect(result.fileCount).toBe(1);
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]?.filename).toBe("generated.csv");
+    expect(result.savedFiles[0]?.filename).toBe("generated.csv");
+  });
+
+  test("uses exact sandbox identity boundaries for submitted inputs", () => {
+    const generatedBundle = {
+      path: "/tmp/attachments-bundle.zip",
+      displayPath: "/tmp/attachments-bundle.zip",
+      generatedBundle: true,
+      sourcePaths: ["projects/README.md"],
+    };
+
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "sandbox:/mnt/data/attachments_bundle6/projects/README.md",
+          sandboxUrl: "sandbox:/mnt/data/attachments_bundle6/projects/README.md",
+        },
+        [generatedBundle],
+      ),
+    ).toBe(true);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fattachments_bundle6%2Fprojects%2FREADME.md",
+          downloadUrl:
+            "https://chatgpt.com/backend-api/sandbox/download?path=%2Fmnt%2Fdata%2Fattachments_bundle6%2Fprojects%2FREADME.md",
+        },
+        [generatedBundle],
+      ),
+    ).toBe(true);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "sandbox:/mnt/data/attachments_bundle6/other/README.md",
+          sandboxUrl: "sandbox:/mnt/data/attachments_bundle6/other/README.md",
+        },
+        [generatedBundle],
+      ),
+    ).toBe(false);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "sandbox:/mnt/data/output/projects/README.md",
+          sandboxUrl: "sandbox:/mnt/data/output/projects/README.md",
+        },
+        [generatedBundle],
+      ),
+    ).toBe(false);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "https://chatgpt.com/backend-api/files/file_result/download",
+          downloadUrl: "https://chatgpt.com/backend-api/files/file_result/download",
+          filename: "README.md",
+        },
+        [generatedBundle],
+      ),
+    ).toBe(false);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "sandbox:/mnt/data/attachments_bundle6/projects/README.md",
+          sandboxUrl: "sandbox:/mnt/data/attachments_bundle6/projects/README.md",
+        },
+        [
+          {
+            path: "/tmp/attachments-bundle.zip",
+            displayPath: "/tmp/attachments-bundle.zip",
+            generatedBundle: false,
+          },
+        ],
+      ),
+    ).toBe(false);
+    expect(
+      __test__.isSubmittedInputReference(
+        {
+          url: "sandbox:/mnt/data/direct-input.pdf",
+          sandboxUrl: "sandbox:/mnt/data/direct-input.pdf",
+        },
+        [{ path: "/tmp/direct-input.pdf", displayPath: "direct-input.pdf" }],
+      ),
+    ).toBe(true);
+  });
+
   test("discovers sandbox links from captured answer markdown when DOM anchors are absent", async () => {
     const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-file-text-"));
     setOracleHomeDirOverrideForTest(tmpHome);

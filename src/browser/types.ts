@@ -28,6 +28,8 @@ export interface BrowserAttachment {
   displayPath: string;
   sizeBytes?: number;
   generatedBundle?: boolean;
+  /** Exact normalized member paths when this attachment is an Oracle-generated archive. */
+  sourcePaths?: string[];
 }
 
 export interface BrowserGeneratedImage {

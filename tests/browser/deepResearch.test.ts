@@ -420,6 +420,324 @@ describe("Deep Research iframe helpers", () => {
     });
   });
 
+  it("binds the submitted prompt when an internal user-like record follows it", async () => {
+    const messageNode = {
+      getAttribute: (name: string) => (name === "data-message-id" ? "submitted-prompt" : null),
+    };
+    const userTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Deep research\nTest scientific prompt",
+      textContent: "Deep research\nTest scientific prompt",
+      querySelector: () => null,
+      querySelectorAll: (selector: string) =>
+        selector === "[data-message-id]" ? [messageNode] : [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "deep-research-internal-user",
+          mapping: {
+            "submitted-prompt": {
+              parent: null,
+              message: {
+                id: "submitted-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+                metadata: {},
+              },
+            },
+            "deep-research-internal-user": {
+              parent: "submitted-prompt",
+              message: {
+                id: "deep-research-internal-user",
+                author: { role: "user" },
+                content: { parts: ["Internal research orchestration state"] },
+                metadata: { is_visually_hidden_from_conversation: true },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [userTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toEqual({
+      conversationId: "conversation-id",
+      messageId: "submitted-prompt",
+      turnIndex: 0,
+    });
+  });
+
+  it("fails closed when more than one active-branch user record matches the prompt", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "duplicate-prompt",
+          mapping: {
+            "submitted-prompt": {
+              parent: null,
+              message: {
+                id: "submitted-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+            "duplicate-prompt": {
+              parent: "submitted-prompt",
+              message: {
+                id: "duplicate-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      conversationId: "conversation-id",
+      unavailable: true,
+      reason: "conversation-user-ambiguous",
+      branchUserCount: 2,
+      branchPromptMatchCount: 2,
+    });
+    expect(result).not.toHaveProperty("messageId");
+  });
+
+  it("uses one exact post-boundary DOM ID to disambiguate repeated prompt records", async () => {
+    const exactIdNode = {
+      getAttribute: (name: string) => (name === "data-message-id" ? "second-prompt" : null),
+    };
+    const exactTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Test scientific prompt",
+      textContent: "Test scientific prompt",
+      querySelector: () => null,
+      querySelectorAll: (selector: string) =>
+        selector === "[data-message-id]" ? [exactIdNode] : [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "second-prompt",
+          mapping: {
+            "first-prompt": {
+              parent: null,
+              message: {
+                id: "first-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+            "second-prompt": {
+              parent: "first-prompt",
+              message: {
+                id: "second-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [exactTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toEqual({
+      conversationId: "conversation-id",
+      messageId: "second-prompt",
+      turnIndex: 0,
+    });
+  });
+
+  it("rejects a sole unrelated post-boundary DOM user instead of accepting it by position", async () => {
+    const unrelatedTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Internal research orchestration state",
+      textContent: "Internal research orchestration state",
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "submitted-prompt",
+          mapping: {
+            "submitted-prompt": {
+              parent: null,
+              message: {
+                id: "submitted-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [unrelatedTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      unavailable: true,
+      reason: "dom-user-turn-unmatched",
+      domUserCount: 1,
+      exactDomMatchCount: 0,
+      promptDomMatchCount: 0,
+    });
+    expect(result).not.toHaveProperty("messageId");
+  });
+
+  it("rejects duplicate DOM exposure of the authenticated prompt ID", async () => {
+    const exactIdNode = {
+      getAttribute: (name: string) => (name === "data-message-id" ? "submitted-prompt" : null),
+    };
+    const exactTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Test scientific prompt",
+      textContent: "Test scientific prompt",
+      querySelector: () => null,
+      querySelectorAll: (selector: string) =>
+        selector === "[data-message-id]" ? [exactIdNode] : [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "submitted-prompt",
+          mapping: {
+            "submitted-prompt": {
+              parent: null,
+              message: {
+                id: "submitted-prompt",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [exactTurn, exactTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      unavailable: true,
+      reason: "dom-user-turn-ambiguous",
+      exactDomMatchCount: 2,
+    });
+    expect(result).not.toHaveProperty("messageId");
+  });
+
   it("uses the pre-submit turn boundary while the exact user DOM is still unhydrated", async () => {
     const fetchMock = vi
       .fn()
@@ -468,6 +786,120 @@ describe("Deep Research iframe helpers", () => {
       messageId: "user-message-exact",
       turnIndex: 4,
     });
+  });
+
+  it("does not use record-only prompt evidence for a resumed conversation", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "historical-user-message",
+          mapping: {
+            "historical-user-message": {
+              parent: null,
+              message: {
+                id: "historical-user-message",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        4,
+        "Test scientific prompt",
+        false,
+        true,
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      conversationId: "conversation-id",
+      unavailable: true,
+      reason: "dom-user-turn-unhydrated",
+      domUserCount: 0,
+    });
+    expect(result).not.toHaveProperty("messageId");
+  });
+
+  it("does not bind a historical record ID from text-only DOM evidence on resume", async () => {
+    const textOnlyTurn = {
+      getAttribute: (name: string) => (name === "data-message-author-role" ? "user" : null),
+      innerText: "Test scientific prompt",
+      textContent: "Test scientific prompt",
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "historical-user-message",
+          mapping: {
+            "historical-user-message": {
+              parent: null,
+              message: {
+                id: "historical-user-message",
+                author: { role: "user" },
+                content: { parts: ["Test scientific prompt"] },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchSubmittedUserTurnExpressionForTest(
+        "conversation-id",
+        0,
+        "Test scientific prompt",
+        false,
+        true,
+      ),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      document: { querySelectorAll: () => [textOnlyTurn] },
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toMatchObject({
+      conversationId: "conversation-id",
+      unavailable: true,
+      reason: "dom-user-turn-unmatched",
+      domUserCount: 1,
+      promptDomMatchCount: 1,
+    });
+    expect(result).not.toHaveProperty("messageId");
   });
 
   it("captures completed localized reports without the English report heading", () => {

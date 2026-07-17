@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
+  BrowserAttachment,
   BrowserDownloadableFile,
   BrowserLogger,
   ChromeClient,
@@ -242,6 +243,97 @@ function normalizeSandboxPath(value?: string | null): string | undefined {
 function normalizeSandboxUrl(value?: string | null): string | undefined {
   const pathName = normalizeSandboxPath(value);
   return pathName ? `sandbox:${pathName}` : undefined;
+}
+
+function sandboxPathFromDownloadableFile(file: BrowserDownloadableFile): string | undefined {
+  for (const value of [file.sandboxUrl, file.url, file.downloadUrl]) {
+    const direct = normalizeSandboxPath(value);
+    if (direct) return direct;
+    const downloadUrl = normalizeChatGptDownloadUrl(value);
+    if (!downloadUrl) continue;
+    try {
+      const url = new URL(downloadUrl);
+      if (url.pathname.toLowerCase() !== "/backend-api/sandbox/download") continue;
+      const pathName = url.searchParams.get("path");
+      if (isSafeSandboxPath(pathName)) return pathName ?? undefined;
+    } catch {
+      // Ignore malformed candidates; the normal download validator handles them separately.
+    }
+  }
+  return undefined;
+}
+
+function normalizeSubmittedPath(value: string): string {
+  return value
+    .replace(/\\/g, "/")
+    .replace(/^[a-zA-Z]:\//, "")
+    .replace(/^\/+/, "")
+    .split("/")
+    .filter((segment) => segment && segment !== "." && segment !== "..")
+    .join("/");
+}
+
+interface SubmittedInputMatcher {
+  uploadNames: Set<string>;
+  bundles: Array<{ rootStem: string; sourcePaths: Set<string> }>;
+}
+
+function normalizeBundleRoot(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function buildSubmittedInputMatcher(
+  submittedAttachments: BrowserAttachment[],
+): SubmittedInputMatcher {
+  return {
+    uploadNames: new Set(submittedAttachments.map((attachment) => path.basename(attachment.path))),
+    bundles: submittedAttachments
+      .filter((attachment) => attachment.generatedBundle)
+      .map((attachment) => ({
+        rootStem: normalizeBundleRoot(
+          path.basename(attachment.path, path.extname(attachment.path)),
+        ),
+        sourcePaths: new Set(
+          (attachment.sourcePaths ?? []).map(normalizeSubmittedPath).filter(Boolean),
+        ),
+      }))
+      .filter((bundle) => bundle.rootStem && bundle.sourcePaths.size > 0),
+  };
+}
+
+function matchesBundleExtractionRoot(root: string, expectedStem: string): boolean {
+  const normalizedRoot = normalizeBundleRoot(root);
+  if (!normalizedRoot.startsWith(expectedStem)) return false;
+  const suffix = normalizedRoot.slice(expectedStem.length);
+  return suffix === "" || /^\d+$/.test(suffix);
+}
+
+function matchesSubmittedInput(
+  file: BrowserDownloadableFile,
+  matcher: SubmittedInputMatcher,
+): boolean {
+  const sandboxPath = sandboxPathFromDownloadableFile(file);
+  if (!sandboxPath) return false;
+  const relativePath = normalizeSubmittedPath(sandboxPath.slice("/mnt/data/".length));
+  if (!relativePath) return false;
+  const relativeSegments = relativePath.split("/");
+  if (relativeSegments.length === 1) {
+    return matcher.uploadNames.has(relativePath);
+  }
+  const [extractionRoot, ...memberSegments] = relativeSegments;
+  const extractedMemberPath = memberSegments.join("/");
+  return matcher.bundles.some(
+    (bundle) =>
+      matchesBundleExtractionRoot(extractionRoot ?? "", bundle.rootStem) &&
+      bundle.sourcePaths.has(extractedMemberPath),
+  );
+}
+
+function isSubmittedInputReference(
+  file: BrowserDownloadableFile,
+  submittedAttachments: BrowserAttachment[],
+): boolean {
+  return matchesSubmittedInput(file, buildSubmittedInputMatcher(submittedAttachments));
 }
 
 function downloadUrlFromSandboxUrl(value?: string | null): string | undefined {
@@ -1576,6 +1668,7 @@ export async function collectChatGptFileArtifacts(params: {
   logger?: BrowserLogger;
   minTurnIndex?: number | null;
   sessionId?: string;
+  submittedAttachments?: BrowserAttachment[];
 }): Promise<{
   files: BrowserDownloadableFile[];
   savedFiles: SavedBrowserFile[];
@@ -1596,16 +1689,23 @@ export async function collectChatGptFileArtifacts(params: {
   params.logger?.(
     `[browser] Found ${textFiles.length} downloadable file link(s) in captured answer text.`,
   );
-  const allFiles = dedupeFiles([...files, ...textFiles]);
-  if (allFiles.length === 0) {
+  const allCandidates = dedupeFiles([...files, ...textFiles]);
+  const submittedAttachments = params.submittedAttachments ?? [];
+  const inputMatcher = buildSubmittedInputMatcher(submittedAttachments);
+  const inputReferences: BrowserDownloadableFile[] = [];
+  const outputFiles: BrowserDownloadableFile[] = [];
+  for (const file of allCandidates) {
+    (matchesSubmittedInput(file, inputMatcher) ? inputReferences : outputFiles).push(file);
+  }
+  if (allCandidates.length === 0) {
     return { files: [], savedFiles: [], fileCount: 0 };
   }
-  params.logger?.(`[browser] Found ${allFiles.length} downloadable file candidate(s).`);
-  allFiles.forEach((file, index) => {
+  params.logger?.(`[browser] Found ${allCandidates.length} downloadable file candidate(s).`);
+  allCandidates.forEach((file, index) => {
     const explicitDownloadUrl = normalizeChatGptDownloadUrl(file.downloadUrl ?? file.url);
     const sandboxDownloadUrl = downloadUrlFromSandboxUrl(file.sandboxUrl ?? file.url);
     params.logger?.(
-      `[browser] Candidate ${index + 1}/${allFiles.length}: ${describeDownloadableCandidate(
+      `[browser] Candidate ${index + 1}/${allCandidates.length}: ${describeDownloadableCandidate(
         file,
         explicitDownloadUrl ?? sandboxDownloadUrl,
       )}`,
@@ -1614,10 +1714,27 @@ export async function collectChatGptFileArtifacts(params: {
   const saved = await saveChatGptDownloadableFiles({
     Network: params.Network,
     Runtime: params.Runtime,
-    files: allFiles,
+    files: outputFiles,
     sessionId: params.sessionId,
     logger: params.logger,
   });
+  const savedInputReferences = await saveChatGptDownloadableFiles({
+    Network: params.Network,
+    Runtime: params.Runtime,
+    files: inputReferences,
+    sessionId: params.sessionId,
+    logger: params.logger,
+  });
+  const failedInputReferences = new Set(savedInputReferences.failedFiles);
+  const preservedInputReferences = inputReferences.filter(
+    (file) => !failedInputReferences.has(file),
+  );
+  if (failedInputReferences.size > 0) {
+    params.logger?.(
+      `[browser] Ignored ${failedInputReferences.size} failed downloadable link candidate(s) proven to point back to submitted inputs.`,
+    );
+  }
+  const allFiles = [...outputFiles, ...preservedInputReferences];
   const buttonSavedFiles =
     saved.failedFiles.length > 0
       ? await saveAssistantDownloadButtonArtifacts({
@@ -1632,8 +1749,8 @@ export async function collectChatGptFileArtifacts(params: {
           sessionId: params.sessionId,
         })
       : [];
-  const savedFiles = [...saved.savedFiles, ...buttonSavedFiles];
-  if (savedFiles.length === 0 && !saved.saved) {
+  const savedFiles = [...saved.savedFiles, ...buttonSavedFiles, ...savedInputReferences.savedFiles];
+  if (allFiles.length > 0 && savedFiles.length === 0 && !saved.saved) {
     const detail = saved.errors.length > 0 ? `\n${saved.errors.join("\n")}` : "";
     params.logger?.(
       `[browser] Auto-save for downloadable files failed; returning metadata only.${detail}`,
@@ -1641,7 +1758,7 @@ export async function collectChatGptFileArtifacts(params: {
     params.logger?.(
       `[browser] WARNING: ${allFiles.length} downloadable candidate(s) existed, but no local browser-host artifact was saved; bridge artifact-ready will not be emitted until ChatGPT file capture succeeds.`,
     );
-  } else {
+  } else if (savedFiles.length > 0) {
     params.logger?.(`[browser] Saved ${savedFiles.length} downloadable file artifact(s).`);
   }
   return {
@@ -1658,6 +1775,7 @@ export const __test__ = {
   normalizeChatGptDownloadUrl,
   normalizeSandboxPath,
   normalizeSandboxUrl,
+  isSubmittedInputReference,
   readTextDownloadableFiles,
   resolveDownloadButtonLabels,
 };

@@ -160,6 +160,8 @@ async function serializeAttachments(
       fileName: path.basename(attachment.path),
       displayPath: attachment.displayPath,
       sizeBytes: attachment.sizeBytes,
+      generatedBundle: attachment.generatedBundle,
+      sourcePaths: attachment.sourcePaths,
       contentBase64: content.toString("base64"),
     });
   }

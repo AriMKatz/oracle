@@ -9,6 +9,8 @@ export interface RemoteAttachmentPayload {
   fileName: string;
   displayPath: string;
   sizeBytes?: number;
+  generatedBundle?: boolean;
+  sourcePaths?: string[];
   contentBase64: string;
 }
 

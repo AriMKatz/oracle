@@ -341,12 +341,14 @@ function buildDeepResearchSubmittedUserTurnExpression(
   minTurnIndex: number,
   expectedPrompt: string,
   promptIsPreview: boolean,
+  requireExactDomId: boolean,
 ): string {
   return `(async () => {
     const expectedConversationId = ${JSON.stringify(expectedConversationId)};
     const minTurnIndex = ${JSON.stringify(Math.floor(minTurnIndex))};
     const expectedPrompt = ${JSON.stringify(expectedPrompt)};
     const promptIsPreview = ${JSON.stringify(promptIsPreview)};
+    const requireExactDomId = ${JSON.stringify(requireExactDomId)};
     const asString = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
     const normalizePromptComparable = (value) =>
       String(value || '')
@@ -370,6 +372,12 @@ function buildDeepResearchSubmittedUserTurnExpression(
     const promptMatchesExpected = (value) => {
       const normalized = normalizePromptComparable(value);
       return promptIsPreview ? normalized.startsWith(expected) : normalized === expected;
+    };
+    const domPromptMatchesExpected = (value) => {
+      const normalized = normalizePromptComparable(value);
+      return promptIsPreview
+        ? normalized.startsWith(expected)
+        : normalized === expected || normalized.startsWith(expected + '\\n');
     };
     const turns = ${buildConversationTurnListExpression()};
     const domUserTurns = [];
@@ -487,47 +495,97 @@ function buildDeepResearchSubmittedUserTurnExpression(
     const branchUsers = currentBranch.filter(
       (node) => node?.message?.author?.role === 'user',
     );
-    const lastBranchUser = branchUsers[branchUsers.length - 1] || null;
-    const branchPromptMatched = Boolean(
-      lastBranchUser && promptMatchesExpected(messageText(lastBranchUser?.message)),
+    const branchPromptMatches = branchUsers.filter((node) =>
+      promptMatchesExpected(messageText(node?.message))
     );
-    if (!lastBranchUser || !branchPromptMatched) {
+    if (branchPromptMatches.length === 0) {
       return {
         conversationId,
         unavailable: true,
         reason: 'conversation-user-unmatched',
         branchUserCount: branchUsers.length,
-        branchPromptMatched,
+        branchPromptMatchCount: 0,
       };
     }
-
-    const messageId = asString(lastBranchUser?.message?.id);
-    if (!messageId) {
-      return { conversationId, unavailable: true, reason: 'conversation-user-id-unavailable' };
+    const branchPromptCandidates = branchPromptMatches.map((node) => ({
+      node,
+      messageId: asString(node?.message?.id),
+    }));
+    const branchPromptMatchIds = Array.from(new Set(
+      branchPromptCandidates.map((candidate) => candidate.messageId).filter(Boolean)
+    ));
+    const exactDomCandidateMatches = [];
+    for (const candidate of branchPromptCandidates) {
+      if (!candidate.messageId) continue;
+      for (const domTurn of domUserTurns) {
+        if (domTurn.ids.includes(candidate.messageId)) {
+          exactDomCandidateMatches.push({ candidate, domTurn });
+        }
+      }
     }
-    const exactDomMatches = domUserTurns.filter((candidate) =>
-      candidate.ids.includes(messageId)
-    );
-    const promptDomMatches = domUserTurns.filter((candidate) =>
-      candidate.text.includes(expected)
-    );
-    const matchedDomTurn =
-      exactDomMatches.length === 1
-        ? exactDomMatches[0]
-        : promptDomMatches.length === 1
-          ? promptDomMatches[0]
-          : domUserTurns.length === 1
-            ? domUserTurns[0]
-            : domUserTurns.length === 0
-              ? { turnIndex: minTurnIndex }
-              : null;
-    if (!matchedDomTurn) {
+    if (exactDomCandidateMatches.length === 1) {
+      const exactMatch = exactDomCandidateMatches[0];
+      return {
+        conversationId,
+        messageId: exactMatch.candidate.messageId,
+        turnIndex: exactMatch.domTurn.turnIndex,
+      };
+    }
+    if (exactDomCandidateMatches.length > 1) {
       return {
         conversationId,
         unavailable: true,
         reason: 'dom-user-turn-ambiguous',
+        branchUserCount: branchUsers.length,
+        branchPromptMatchCount: branchPromptMatches.length,
+        branchPromptMatchIdCount: branchPromptMatchIds.length,
         domUserCount: domUserTurns.length,
-        exactDomMatchCount: exactDomMatches.length,
+        exactDomMatchCount: exactDomCandidateMatches.length,
+      };
+    }
+    if (branchPromptCandidates.length !== 1) {
+      return {
+        conversationId,
+        unavailable: true,
+        reason: 'conversation-user-ambiguous',
+        branchUserCount: branchUsers.length,
+        branchPromptMatchCount: branchPromptMatches.length,
+        branchPromptMatchIdCount: branchPromptMatchIds.length,
+      };
+    }
+    const submittedBranchUser = branchPromptCandidates[0];
+    const messageId = submittedBranchUser.messageId;
+    if (!messageId) {
+      return {
+        conversationId,
+        unavailable: true,
+        reason: 'conversation-user-id-unavailable',
+        branchUserCount: branchUsers.length,
+        branchPromptMatchCount: branchPromptMatches.length,
+        branchPromptMatchIdCount: branchPromptMatchIds.length,
+      };
+    }
+    const promptDomMatches = domUserTurns.filter((candidate) =>
+      domPromptMatchesExpected(candidate.text)
+    );
+    const matchedDomTurn =
+      !requireExactDomId && promptDomMatches.length === 1
+        ? promptDomMatches[0]
+        : !requireExactDomId && domUserTurns.length === 0
+          ? { turnIndex: minTurnIndex }
+          : null;
+    if (!matchedDomTurn) {
+      return {
+        conversationId,
+        unavailable: true,
+        reason:
+          promptDomMatches.length > 1
+            ? 'dom-user-turn-ambiguous'
+            : domUserTurns.length === 0
+              ? 'dom-user-turn-unhydrated'
+              : 'dom-user-turn-unmatched',
+        domUserCount: domUserTurns.length,
+        exactDomMatchCount: 0,
         promptDomMatchCount: promptDomMatches.length,
       };
     }
@@ -541,7 +599,7 @@ export async function waitForDeepResearchSubmittedUserTurn(
   minTurnIndex: number | null | undefined,
   expectedPrompt: string | null | undefined,
   timeoutMs = 60_000,
-  options: { promptIsPreview?: boolean } = {},
+  options: { promptIsPreview?: boolean; requireExactDomId?: boolean } = {},
 ): Promise<DeepResearchSubmittedUserTurn> {
   const prompt = expectedPrompt?.trim();
   if (
@@ -565,6 +623,7 @@ export async function waitForDeepResearchSubmittedUserTurn(
         minTurnIndex,
         prompt,
         options.promptIsPreview === true,
+        options.requireExactDomId === true,
       ),
       awaitPromise: true,
       returnByValue: true,
@@ -579,7 +638,8 @@ export async function waitForDeepResearchSubmittedUserTurn(
           reason?: string;
           status?: number;
           branchUserCount?: number;
-          branchPromptMatched?: boolean;
+          branchPromptMatchCount?: number;
+          branchPromptMatchIdCount?: number;
           domUserCount?: number;
           exactDomMatchCount?: number;
           promptDomMatchCount?: number;
@@ -606,8 +666,11 @@ export async function waitForDeepResearchSubmittedUserTurn(
         ...(typeof value.branchUserCount === "number"
           ? { branchUserCount: value.branchUserCount }
           : {}),
-        ...(typeof value.branchPromptMatched === "boolean"
-          ? { branchPromptMatched: value.branchPromptMatched }
+        ...(typeof value.branchPromptMatchCount === "number"
+          ? { branchPromptMatchCount: value.branchPromptMatchCount }
+          : {}),
+        ...(typeof value.branchPromptMatchIdCount === "number"
+          ? { branchPromptMatchIdCount: value.branchPromptMatchIdCount }
           : {}),
         ...(typeof value.domUserCount === "number" ? { domUserCount: value.domUserCount } : {}),
         ...(typeof value.exactDomMatchCount === "number"
@@ -636,12 +699,14 @@ export function buildDeepResearchSubmittedUserTurnExpressionForTest(
   minTurnIndex: number,
   expectedPrompt: string,
   promptIsPreview = false,
+  requireExactDomId = false,
 ): string {
   return buildDeepResearchSubmittedUserTurnExpression(
     expectedConversationId,
     minTurnIndex,
     expectedPrompt,
     promptIsPreview,
+    requireExactDomId,
   );
 }
 

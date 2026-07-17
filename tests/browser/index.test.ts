@@ -884,6 +884,9 @@ describe("runSubmissionWithRecoveryForTest", () => {
       baselineTurns: 7,
       baselineAssistantText: "done",
       submittedPrompt: "fallback prompt",
+      submittedAttachments: [
+        { path: "/tmp/fallback.txt", displayPath: "fallback.txt", sizeBytes: 12 },
+      ],
     });
 
     expect(reloadPromptComposer).toHaveBeenCalledTimes(1);

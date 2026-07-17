@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { __test__, createStoredZip } from "../../src/browser/zipBundle.js";
+import {
+  __test__,
+  createStoredZip,
+  createStoredZipWithManifest,
+} from "../../src/browser/zipBundle.js";
 
 const LOCAL_FILE_HEADER = 0x04034b50;
 const CENTRAL_DIRECTORY_HEADER = 0x02014b50;
@@ -84,19 +88,16 @@ describe("createStoredZip", () => {
   });
 
   test("normalizes unsafe paths and preserves unique names", () => {
-    const zip = createStoredZip([
+    const bundle = createStoredZipWithManifest([
       { path: "../secret.txt", content: "secret" },
       { path: "/abs/file.txt", content: "absolute" },
       { path: "C:\\repo\\same.txt", content: "windows" },
       { path: "C:/repo/same.txt", content: "duplicate" },
     ]);
 
-    expect(readStoredZip(zip).map((entry) => entry.name)).toEqual([
-      "secret.txt",
-      "abs/file.txt",
-      "repo/same.txt",
-      "repo/same-2.txt",
-    ]);
+    const expectedPaths = ["secret.txt", "abs/file.txt", "repo/same.txt", "repo/same-2.txt"];
+    expect(bundle.entryPaths).toEqual(expectedPaths);
+    expect(readStoredZip(bundle.buffer).map((entry) => entry.name)).toEqual(expectedPaths);
   });
 
   test("rejects ZIP32 entry count overflow", () => {

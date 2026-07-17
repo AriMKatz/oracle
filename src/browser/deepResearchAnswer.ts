@@ -300,13 +300,21 @@ function citationStatusMatchesMarkdown(
 ): { matches: boolean; observed: ReturnType<typeof readMarkdownCitationEvidence> } {
   const observed = readMarkdownCitationEvidence(markdown);
   const expectedMissing = status.missingIndexes.slice().sort((a, b) => a - b);
+  const missingMatchesExactly =
+    expectedMissing.length === observed.missingIndexes.length &&
+    expectedMissing.every((index, position) => index === observed.missingIndexes[position]);
+  const exactCountsMatch =
+    status.total === observed.total && status.linked === observed.linked && missingMatchesExactly;
+  const completeStatusHasFullyLinkedBibliographySuperset =
+    status.total > 0 &&
+    status.missingIndexes.length === 0 &&
+    observed.missingIndexes.length === 0 &&
+    observed.total >= status.total &&
+    observed.linked >= status.linked;
   return {
     matches:
       observed.leakedInternalMarkers.length === 0 &&
-      status.total === observed.total &&
-      status.linked === observed.linked &&
-      expectedMissing.length === observed.missingIndexes.length &&
-      expectedMissing.every((index, position) => index === observed.missingIndexes[position]),
+      (exactCountsMatch || completeStatusHasFullyLinkedBibliographySuperset),
     observed,
   };
 }

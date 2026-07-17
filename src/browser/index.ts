@@ -800,7 +800,10 @@ type BrowserSubmissionAttemptResult = {
   deepResearchTargetBaselineCaptured?: boolean;
 };
 
-type BrowserSubmissionResult = BrowserSubmissionAttemptResult & { submittedPrompt: string };
+type BrowserSubmissionResult = BrowserSubmissionAttemptResult & {
+  submittedPrompt: string;
+  submittedAttachments: BrowserAttachment[];
+};
 
 async function captureDeepResearchTargetBaseline(
   client: ChromeClient,
@@ -861,6 +864,7 @@ async function runSubmissionWithRecovery({
       return {
         ...(await submit(currentPrompt, currentAttachments)),
         submittedPrompt: currentPrompt,
+        submittedAttachments: currentAttachments,
       };
     } catch (error) {
       const isDeadComposer = hasBrowserErrorCode(error, "dead-composer");
@@ -1740,6 +1744,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     let baselineTurns: number | null = null;
     let baselineAssistantText: string | null = null;
     let submittedPrompt = promptText;
+    let submittedAttachments = attachments;
     let deepResearchTargetBaseline: DeepResearchTargetBaseline[] = [];
     let deepResearchTargetBaselineCaptured = false;
     await acquireProfileLockIfNeeded();
@@ -1760,6 +1765,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       baselineTurns = submission.baselineTurns;
       baselineAssistantText = submission.baselineAssistantText;
       submittedPrompt = submission.submittedPrompt;
+      submittedAttachments = submission.submittedAttachments;
       deepResearchTargetBaseline = submission.deepResearchTargetBaseline ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
@@ -1784,6 +1790,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           expectedConversationId,
           baselineTurns,
           submittedPrompt,
+          60_000,
+          { requireExactDomId: isResumingConversation },
         ),
       );
       submittedUserMessageId = submittedUserTurn.messageId;
@@ -2345,6 +2353,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
+      submittedAttachments,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);
@@ -3374,6 +3383,8 @@ async function runRemoteBrowserMode(
         expectedConversationId,
         baselineTurns,
         submission.submittedPrompt,
+        60_000,
+        { requireExactDomId: Boolean(config.resumeConversationUrl) },
       );
       submittedUserMessageId = submittedUserTurn.messageId;
       submittedUserTurnIndex = submittedUserTurn.turnIndex;
@@ -3888,6 +3899,7 @@ async function runRemoteBrowserMode(
       logger,
       minTurnIndex: imageArtifactMinTurnIndex,
       sessionId: options.sessionId,
+      submittedAttachments: submission.submittedAttachments,
     });
     const savedImageArtifacts = appendArtifacts(undefined, imageArtifacts.savedImages);
     const savedBrowserArtifacts = appendArtifacts(savedImageArtifacts, fileArtifacts.savedFiles);

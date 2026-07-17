@@ -161,6 +161,53 @@ describe("buildDeepResearchAnswerFields", () => {
     });
   });
 
+  test("accepts fully linked numeric bibliography anchors beyond the interactive citation count", () => {
+    const reportWithBibliography =
+      "Finding [1](<https://example.com/primary>)\n\n" +
+      "References\n\n2. [2](<https://example.com/bibliography>)";
+    const result = buildDeepResearchAnswerFields({
+      text: reportWithBibliography,
+      meta: {},
+      assistantTurn: validEvidence(reportWithBibliography),
+      citationStatus: { total: 1, linked: 1, missingIndexes: [] },
+    });
+
+    expect(result.citationStatus).toEqual({ total: 1, linked: 1, missingIndexes: [] });
+    expect(result.warnings).toBeUndefined();
+  });
+
+  test("rejects an unresolved extra numeric citation beyond the interactive citation count", () => {
+    const reportWithUnresolvedBibliography =
+      "Finding [1](<https://example.com/primary>)\n\nReferences\n\n2. [2]";
+    const result = buildDeepResearchAnswerFields({
+      text: reportWithUnresolvedBibliography,
+      meta: {},
+      assistantTurn: validEvidence(reportWithUnresolvedBibliography),
+      citationStatus: { total: 1, linked: 1, missingIndexes: [] },
+    });
+
+    expect(result.warnings?.[0]).toMatchObject({
+      code: "browser-deep-research-citations-incomplete",
+      details: { citationStatus: "report-mismatch" },
+    });
+  });
+
+  test("keeps exact count matching when interactive citation status is incomplete", () => {
+    const incompleteWithExtraLink =
+      "Finding [1]\n\nReferences\n\n2. [2](<https://example.com/bibliography>)";
+    const result = buildDeepResearchAnswerFields({
+      text: incompleteWithExtraLink,
+      meta: {},
+      assistantTurn: validEvidence(incompleteWithExtraLink),
+      citationStatus: { total: 1, linked: 0, missingIndexes: [1] },
+    });
+
+    expect(result.warnings?.[0]).toMatchObject({
+      code: "browser-deep-research-citations-incomplete",
+      details: { citationStatus: "report-mismatch" },
+    });
+  });
+
   test("rejects leaked internal citation markers even when numeric totals agree", () => {
     const marker = `Finding[[ORACLE_DEEP_RESEARCH_CITATION_${"a".repeat(32)}_1]]`;
     const result = buildDeepResearchAnswerFields({

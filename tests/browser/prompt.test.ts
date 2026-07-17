@@ -491,6 +491,7 @@ describe("assembleBrowserPrompt", () => {
       expect(result.attachments).toHaveLength(1);
       expect(result.attachments[0]?.displayPath).toMatch(/attachments-bundle\.zip$/);
       expect(result.attachments[0]?.generatedBundle).toBe(true);
+      expect(result.attachments[0]?.sourcePaths).toEqual(["src/a.ts", "src/b.ts"]);
       expect(result.bundled).toEqual({
         originalCount: 2,
         bundlePath: result.attachments[0]?.displayPath,
