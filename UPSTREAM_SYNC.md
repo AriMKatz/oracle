@@ -100,6 +100,14 @@ The fork owns the local execution contract:
 - compatible controls such as attachments, attach-running Chrome, remote
   Chrome, follow-ups, replay, research, and archiving remain available as
   explicit choices rather than automatic fallbacks;
+- each assistant attachment reference receives one normal download attempt
+  because a same-path reference may be new or modified output, and every
+  successful download is preserved; when the attempt fails, only a reference
+  proven by exact sandbox identity to be an originally submitted direct input
+  or an exact member recorded in an Oracle-generated bundle manifest is exempt
+  from output-file fallbacks, missing-output accounting, and archive blocking;
+  genuine or ambiguous unsaved artifacts remain reportable failures and block
+  archiving;
 - distinct copied-profile browser reviews may run concurrently, and an
   unrelated running session never requires waiting, serialization, or reuse;
 - API-oriented CLI guidance does not govern browser-session concurrency or
@@ -251,6 +259,9 @@ Reject an upstream effect—or omit that part of a mixed change—when it would:
   Research capture as fully verified;
 - require invasive Keychain changes or hidden machine-only state;
 - remove compatible optional controls only because they are not the default;
+- treat a failed exact submitted-input reference as missing generated output
+  or allow it to block archiving, or conversely waive an ambiguous reference or
+  genuine generated artifact as though it were proven input;
 - remove or weaken the installed skill's standing informed external-upload
   consent contract, or move that consent into an Oracle prompt or attached
   review context;

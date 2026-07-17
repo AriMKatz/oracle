@@ -303,6 +303,15 @@ sed -n '/^## Answer$/,$p' \
   `ORACLE_HOME_DIR`.
 - Browser artifacts include `transcript.md` and, when available, research
   reports and generated images.
+- Make one normal download attempt for each assistant attachment reference
+  because a same-path reference may be new or modified output. Preserve every
+  successful download. If the attempt fails and exact sandbox identity proves
+  that the reference is an originally submitted direct input or an exact member
+  recorded in an Oracle-generated bundle manifest, do not retry it through
+  output-file fallbacks, count it as missing generated output, invalidate the
+  saved answer, or let it block optional conversation archiving. Genuine or
+  ambiguous artifacts remain reportable failures and block archiving when
+  unsaved.
 - List recent sessions with `oracle status --hours 72`.
 - Use `oracle session <id> --render` to replay a completed session or reattach
   an eligible incomplete run.

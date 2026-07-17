@@ -5,6 +5,7 @@
 ### Fixed
 
 - CLI: avoid inheriting `browser.thinkingTime` from config when `--browser-model-strategy current` is explicit, while preserving an explicit `--browser-thinking-time` override. Thanks @jung0han!
+- Browser: preserve successful same-path attachment outputs while preventing failed references proven to be exact submitted inputs, including recorded bundle members, from being misclassified as missing generated artifacts and blocking conversation archiving; ambiguous and genuine unsaved outputs remain fail-closed.
 
 ## 0.16.0 — 2026-07-12
 
