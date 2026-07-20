@@ -353,12 +353,13 @@ describe("resumeBrowserSession", () => {
       return { result: { value: null } };
     });
     const close = vi.fn(async () => {});
-    const connect = vi.fn(async () => ({
+    const connectMock = vi.fn(async () => ({
       Runtime: { enable: vi.fn(), evaluate },
       DOM: { enable: vi.fn() },
       Page: { enable: vi.fn() },
       close,
     })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const connect = connectMock;
     const waitForDeepResearchCompletion = vi.fn();
     const recoverSession = vi.fn(async () => ({
       answerText: "safe recovery",
@@ -454,6 +455,324 @@ describe("resumeBrowserSession", () => {
 
     expect(result.answerMarkdown).toBe("fallback-md");
     expect(recoverSession).toHaveBeenCalled();
+  });
+
+  test("never launches a fresh browser when a copied-profile endpoint is missing", async () => {
+    const runtime = {
+      chromePid: 4242,
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const recoverSession = vi.fn(async () => ({
+      answerText: "unsafe fallback",
+      answerMarkdown: "unsafe fallback",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      resumeBrowserSession(runtime, { copyProfileSource: "/source/chrome-profile" }, logger, {
+        recoverSession,
+      }),
+    ).rejects.toThrow(/exact existing Chrome endpoint.*fallback is disabled/i);
+
+    expect(recoverSession).not.toHaveBeenCalled();
+  });
+
+  test("persists, closes, then cleans the exact copied-profile Chrome", async () => {
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const identity = {
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: "/source/chrome-profile",
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    };
+    const order: string[] = [];
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    const evaluate = vi.fn(async ({ expression }: { expression: string }) => {
+      if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+      if (expression === "1+1") return { result: { value: 2 } };
+      return { result: { value: null } };
+    });
+    const connect = vi.fn(async () => ({
+      Runtime: { enable: vi.fn(), evaluate },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {
+        order.push("close");
+      }),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const validateCopiedProfileChrome = vi.fn(async () => identity);
+    const cleanupCopiedProfileChrome = vi.fn(async () => {
+      order.push("cleanup");
+    });
+    const recoverSession = vi.fn(async () => ({
+      answerText: "unsafe fallback",
+      answerMarkdown: "unsafe fallback",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    const result = await resumeBrowserSession(
+      runtime,
+      { copyProfileSource: identity.sourceUserDataDir, timeoutMs: 2_000 },
+      logger,
+      {
+        listTargets,
+        connect,
+        validateCopiedProfileChrome,
+        cleanupCopiedProfileChrome,
+        recoverSession,
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "reattached answer",
+          html: "",
+          meta: { messageId: "m1", turnId: "conversation-turn-1" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+        persistResultBeforeClose: vi.fn(async () => {
+          order.push("persist");
+          return true;
+        }),
+      },
+    );
+
+    expect(result.answerMarkdown).toBe("reattached markdown");
+    expect(order).toEqual(["persist", "close", "cleanup"]);
+    expect(validateCopiedProfileChrome).toHaveBeenCalledWith({
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: identity.sourceUserDataDir,
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    });
+    expect(cleanupCopiedProfileChrome).toHaveBeenCalledWith(identity, logger);
+    expect(recoverSession).not.toHaveBeenCalled();
+  });
+
+  test("preserves exact copied-profile Chrome when required artifact persistence returns false", async () => {
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const identity = {
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: "/source/chrome-profile",
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    };
+    const order: string[] = [];
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    const connectMock = vi.fn(async () => ({
+      Runtime: {
+        enable: vi.fn(),
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+          if (expression === "1+1") return { result: { value: 2 } };
+          return { result: { value: null } };
+        }),
+      },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {
+        order.push("close");
+      }),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const connect = connectMock;
+    const cleanupCopiedProfileChrome = vi.fn(async () => {
+      order.push("cleanup");
+    });
+    const recoverSession = vi.fn(async () => ({
+      answerText: "unsafe fallback",
+      answerMarkdown: "unsafe fallback",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { copyProfileSource: identity.sourceUserDataDir, timeoutMs: 2_000 },
+        logger,
+        {
+          listTargets,
+          connect,
+          validateCopiedProfileChrome: vi.fn(async () => identity),
+          cleanupCopiedProfileChrome,
+          recoverSession,
+          waitForAssistantResponse: vi.fn(async () => ({
+            text: "reattached answer",
+            html: "",
+            meta: { messageId: "m1", turnId: "conversation-turn-1" },
+          })),
+          captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+          persistResultBeforeClose: vi.fn(async () => {
+            order.push("persist");
+            return false;
+          }),
+        },
+      ),
+    ).rejects.toThrow(/required local artifacts.*preserved/i);
+
+    expect(order).toEqual(["persist", "close"]);
+    expect(cleanupCopiedProfileChrome).not.toHaveBeenCalled();
+    expect(recoverSession).not.toHaveBeenCalled();
+  });
+
+  test("ignores a hostile persisted websocket and uses only validated host and port", async () => {
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeBrowserWSEndpoint: "ws://attacker.invalid:51559/devtools/browser/hostile",
+      chromeTargetId: "target-1",
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const identity = {
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: "/source/chrome-profile",
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    };
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]);
+    const connectMock = vi.fn(async () => ({
+      Runtime: {
+        enable: vi.fn(),
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+          if (expression === "1+1") return { result: { value: 2 } };
+          return { result: { value: null } };
+        }),
+      },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {}),
+    }));
+    const connect = connectMock as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const logger = vi.fn() as BrowserLogger;
+
+    await resumeBrowserSession(
+      runtime,
+      { copyProfileSource: identity.sourceUserDataDir, timeoutMs: 2_000 },
+      logger,
+      {
+        listTargets,
+        connect,
+        validateCopiedProfileChrome: vi.fn(async () => identity),
+        cleanupCopiedProfileChrome: vi.fn(async () => {}),
+        waitForAssistantResponse: vi.fn(async () => ({
+          text: "reattached answer",
+          html: "",
+          meta: { messageId: "m1", turnId: "conversation-turn-1" },
+        })),
+        captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+      },
+    );
+
+    expect(listTargets).toHaveBeenCalledWith({
+      host: identity.host,
+      port: identity.port,
+      browserWSEndpoint: undefined,
+    });
+    expect(connect).toHaveBeenCalledWith({
+      host: identity.host,
+      port: identity.port,
+      target: runtime.chromeTargetId,
+    });
+    expect(JSON.stringify([listTargets.mock.calls, connectMock.mock.calls])).not.toContain(
+      "attacker.invalid",
+    );
+  });
+
+  test("cleans an exact copied profile after attach failure without fresh-browser fallback", async () => {
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const identity = {
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: "/source/chrome-profile",
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    };
+    const order: string[] = [];
+    const listTargets = vi.fn(async () => [
+      { targetId: "target-1", type: "page", url: runtime.tabUrl },
+    ]) as unknown as () => Promise<FakeTarget[]>;
+    const connect = vi.fn(async () => ({
+      Runtime: {
+        enable: vi.fn(),
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+          if (expression === "1+1") return { result: { value: 2 } };
+          return { result: { value: null } };
+        }),
+      },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {
+        order.push("close");
+      }),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const cleanupCopiedProfileChrome = vi.fn(async () => {
+      order.push("cleanup");
+    });
+    const recoverSession = vi.fn(async () => ({
+      answerText: "unsafe fallback",
+      answerMarkdown: "unsafe fallback",
+    }));
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { copyProfileSource: identity.sourceUserDataDir, timeoutMs: 2_000 },
+        logger,
+        {
+          listTargets,
+          connect,
+          validateCopiedProfileChrome: vi.fn(async () => identity),
+          cleanupCopiedProfileChrome,
+          recoverSession,
+          waitForAssistantResponse: vi.fn(async () => {
+            throw new Error("response timeout");
+          }),
+        },
+      ),
+    ).rejects.toThrow(/Exact copied-profile Chrome recovery failed.*fallback is disabled/i);
+
+    expect(order).toEqual(["close", "cleanup"]);
+    expect(cleanupCopiedProfileChrome).toHaveBeenCalledOnce();
+    expect(recoverSession).not.toHaveBeenCalled();
+    expect(logger).not.toHaveBeenCalledWith(expect.stringContaining("reopening browser"));
   });
 
   test("tries live reattach from browser websocket metadata before falling back", async () => {

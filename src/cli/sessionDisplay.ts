@@ -36,6 +36,7 @@ import {
   resolveSessionLineage,
 } from "./sessionLineage.js";
 import { formatSessionExecutionLabel } from "./sessionLifecycle.js";
+import { acquireSessionReattachLease } from "./sessionReattachLease.js";
 
 const isTty = (): boolean => Boolean(process.stdout.isTTY);
 const dim = (text: string): string => (isTty() ? kleur.dim(text) : text);
@@ -169,6 +170,57 @@ async function saveReattachBrowserArtifacts(
   };
 }
 
+async function terminalizeFailedRecovery(
+  sessionId: string,
+  metadata: SessionMetadata,
+  message: string,
+  artifacts?: SessionMetadata["artifacts"],
+): Promise<SessionMetadata> {
+  const copiedProfile = Boolean(metadata.browser?.config?.copyProfileSource);
+  const prefix = copiedProfile
+    ? "Exact copied-profile browser recovery failed"
+    : "Browser session recovery failed";
+  const errorMessage = `${prefix}: ${message}`;
+  const completedAt = new Date().toISOString();
+  const response = { status: "incomplete", incompleteReason: "controller-disconnected" };
+  const error = {
+    category: "browser-automation",
+    message: errorMessage,
+    details: {
+      stage: "reattach-failed",
+      reattachable: false,
+      recovery: copiedProfile ? "copied-profile-orphan" : "controller-orphan",
+    },
+  };
+  if (metadata.model) {
+    await sessionStore.updateModelRun(metadata.id, metadata.model, {
+      status: "error",
+      completedAt,
+      response,
+      error,
+    });
+  }
+  await sessionStore.updateSession(sessionId, {
+    status: "error",
+    completedAt,
+    errorMessage,
+    response,
+    error,
+    ...(artifacts ? { artifacts } : {}),
+  });
+  return (
+    (await sessionStore.readSession(sessionId)) ?? {
+      ...metadata,
+      status: "error",
+      completedAt,
+      errorMessage,
+      response,
+      error,
+      ...(artifacts ? { artifacts } : {}),
+    }
+  );
+}
+
 export interface ShowStatusOptions {
   hours: number;
   includeAll: boolean;
@@ -276,10 +328,9 @@ export async function attachSession(
       return;
     }
   }
-  const initialStatus = metadata.status;
   const wantsRender = Boolean(options?.renderMarkdown);
   const isVerbose = Boolean(process.env.ORACLE_VERBOSE_RENDER);
-  const runtime = metadata.browser?.runtime;
+  let runtime = metadata.browser?.runtime;
   const controllerAlive = isProcessAlive(runtime?.controllerPid);
 
   const hasChromeDisconnect = metadata.response?.incompleteReason === "chrome-disconnected";
@@ -322,124 +373,149 @@ export async function attachSession(
       (runtime?.controllerPid && !controllerAlive));
 
   if (canReattach) {
-    const metadataAtReattach = metadata as SessionMetadata;
-    const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
-    const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
-    console.log(
-      chalk.yellow(
-        `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
-      ),
-    );
-    try {
+    const claim = await acquireSessionReattachLease(sessionId);
+    if (!claim.acquired) {
+      const owner = claim.ownerPid ? ` pid ${claim.ownerPid}` : " another live process";
+      console.log(
+        chalk.yellow(`Recovery is already owned by${owner}; observing this session instead.`),
+      );
+    } else {
       let persistedArtifacts: Awaited<ReturnType<typeof saveReattachBrowserArtifacts>> | undefined;
-      const result = await resumeBrowserSession(
-        runtime as NonNullable<typeof runtime>,
-        metadata.browser?.config,
-        Object.assign(
-          ((message?: string) => {
-            if (message) {
-              console.log(dim(message));
-            }
-          }) as unknown as BrowserLogger,
-          { verbose: true },
-        ),
-        {
-          promptPreview: metadata.promptPreview,
-          persistResultBeforeClose: async (captured) => {
-            persistedArtifacts = await saveReattachBrowserArtifacts(
-              sessionId,
-              metadataAtReattach,
-              captured,
-            );
-            return persistedArtifacts.requiredArtifactsSaved;
+      try {
+        runtime = runtime ? { ...runtime, controllerPid: process.pid } : runtime;
+        metadata = await sessionStore.updateSession(sessionId, {
+          browser: {
+            ...metadata.browser,
+            runtime,
           },
-        },
-      );
-      const outputTokens = estimateTokenCount(result.answerMarkdown);
-      const freshDeepResearchWarnings = isDeepResearchBrowserSession(metadata)
-        ? addDeepResearchPickerEvidenceWarning(
-            revalidateDeepResearchAnswerFields(result).warnings ?? [],
-            metadata.browser?.modelSelection,
-          )
-        : [];
-      const saved =
-        persistedArtifacts ?? (await saveReattachBrowserArtifacts(sessionId, metadata, result));
-      const artifacts = saved.artifacts;
-      await writeReattachAnswer(
-        sessionId,
-        result,
-        completedDeepResearchPlaceholder ||
-          (hasIncompleteCapture && deepResearchPlaceholderCapture),
-      );
-      if (metadata.model) {
-        await sessionStore.updateModelRun(metadata.id, metadata.model, {
+        });
+        const metadataAtReattach = metadata as SessionMetadata;
+        const portInfo = runtime?.chromePort ? `port ${runtime.chromePort}` : "unknown port";
+        const urlInfo = runtime?.tabUrl ? `url=${runtime.tabUrl}` : "url=unknown";
+        console.log(
+          chalk.yellow(
+            `Attempting to reattach to the existing Chrome session (${portInfo}, ${urlInfo})...`,
+          ),
+        );
+        const result = await resumeBrowserSession(
+          runtime as NonNullable<typeof runtime>,
+          metadata.browser?.config,
+          Object.assign(
+            ((message?: string) => {
+              if (message) {
+                console.log(dim(message));
+              }
+            }) as unknown as BrowserLogger,
+            { verbose: true },
+          ),
+          {
+            promptPreview: metadata.promptPreview,
+            persistResultBeforeClose: async (captured) => {
+              persistedArtifacts = await saveReattachBrowserArtifacts(
+                sessionId,
+                metadataAtReattach,
+                captured,
+              );
+              return persistedArtifacts.requiredArtifactsSaved;
+            },
+          },
+        );
+        const outputTokens = estimateTokenCount(result.answerMarkdown);
+        const freshDeepResearchWarnings = isDeepResearchBrowserSession(metadata)
+          ? addDeepResearchPickerEvidenceWarning(
+              revalidateDeepResearchAnswerFields(result).warnings ?? [],
+              metadata.browser?.modelSelection,
+            )
+          : [];
+        const saved =
+          persistedArtifacts ?? (await saveReattachBrowserArtifacts(sessionId, metadata, result));
+        const artifacts = saved.artifacts;
+        await writeReattachAnswer(
+          sessionId,
+          result,
+          completedDeepResearchPlaceholder ||
+            (hasIncompleteCapture && deepResearchPlaceholderCapture),
+        );
+        if (metadata.model) {
+          await sessionStore.updateModelRun(metadata.id, metadata.model, {
+            status: "completed",
+            usage: {
+              inputTokens: 0,
+              outputTokens,
+              reasoningTokens: 0,
+              totalTokens: outputTokens,
+            },
+            completedAt: new Date().toISOString(),
+          });
+        }
+        await sessionStore.updateSession(sessionId, {
           status: "completed",
+          completedAt: new Date().toISOString(),
           usage: {
             inputTokens: 0,
             outputTokens,
             reasoningTokens: 0,
             totalTokens: outputTokens,
           },
-          completedAt: new Date().toISOString(),
+          errorMessage: undefined,
+          browser: {
+            ...metadata.browser,
+            config: metadata.browser?.config,
+            runtime: runtime ? { ...runtime, assistantTurn: result.assistantTurn } : runtime,
+            archive: result.archive ?? metadata.browser?.archive,
+            modelSelection: metadata.browser?.modelSelection,
+            citationStatus: isDeepResearchBrowserSession(metadata)
+              ? result.citationStatus
+              : metadata.browser?.citationStatus,
+            warnings: isDeepResearchBrowserSession(metadata)
+              ? replaceDeepResearchEvidenceWarnings(
+                  metadata.browser?.warnings,
+                  freshDeepResearchWarnings,
+                )
+              : metadata.browser?.warnings,
+          },
+          artifacts,
+          response: { status: "completed" },
+          error: undefined,
+          transport: undefined,
         });
-      }
-      await sessionStore.updateSession(sessionId, {
-        status: "completed",
-        completedAt: new Date().toISOString(),
-        usage: {
-          inputTokens: 0,
-          outputTokens,
-          reasoningTokens: 0,
-          totalTokens: outputTokens,
-        },
-        errorMessage: undefined,
-        browser: {
-          ...metadata.browser,
-          config: metadata.browser?.config,
-          runtime: runtime ? { ...runtime, assistantTurn: result.assistantTurn } : runtime,
-          archive: result.archive ?? metadata.browser?.archive,
-          modelSelection: metadata.browser?.modelSelection,
-          citationStatus: isDeepResearchBrowserSession(metadata)
-            ? result.citationStatus
-            : metadata.browser?.citationStatus,
-          warnings: isDeepResearchBrowserSession(metadata)
-            ? replaceDeepResearchEvidenceWarnings(
-                metadata.browser?.warnings,
-                freshDeepResearchWarnings,
-              )
-            : metadata.browser?.warnings,
-        },
-        artifacts,
-        response: { status: "completed" },
-        error: undefined,
-        transport: undefined,
-      });
-      console.log(chalk.green("Reattach succeeded; session marked completed."));
-      metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(chalk.red(`Reattach failed: ${message}`));
-      if (completedDeepResearchPlaceholder) {
-        if (metadata.model) {
-          await sessionStore.updateModelRun(metadata.id, metadata.model, {
+        console.log(chalk.green("Reattach succeeded; session marked completed."));
+        metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(chalk.red(`Reattach failed: ${message}`));
+        const copiedProfileRecovery = Boolean(metadata.browser?.config?.copyProfileSource);
+        if (completedDeepResearchPlaceholder && !copiedProfileRecovery) {
+          if (metadata.model) {
+            await sessionStore.updateModelRun(metadata.id, metadata.model, {
+              status: "error",
+              response: { status: "incomplete", incompleteReason: "incomplete-capture" },
+              error: {
+                category: "browser-automation",
+                message: `Deep Research capture incomplete: ${message}`,
+              },
+            });
+          }
+          await sessionStore.updateSession(sessionId, {
             status: "error",
+            errorMessage: `Deep Research capture incomplete: ${message}`,
             response: { status: "incomplete", incompleteReason: "incomplete-capture" },
             error: {
               category: "browser-automation",
               message: `Deep Research capture incomplete: ${message}`,
             },
           });
+          metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+        } else {
+          metadata = await terminalizeFailedRecovery(
+            sessionId,
+            metadata,
+            message,
+            persistedArtifacts?.artifacts,
+          );
         }
-        await sessionStore.updateSession(sessionId, {
-          status: "error",
-          errorMessage: `Deep Research capture incomplete: ${message}`,
-          response: { status: "incomplete", incompleteReason: "incomplete-capture" },
-          error: {
-            category: "browser-automation",
-            message: `Deep Research capture incomplete: ${message}`,
-          },
-        });
-        metadata = (await sessionStore.readSession(sessionId)) ?? metadata;
+      } finally {
+        await claim.lease.release();
       }
     }
   }
@@ -507,7 +583,7 @@ export async function attachSession(
   }
 
   const shouldTrimIntro =
-    initialStatus === "completed" || initialStatus === "partial" || initialStatus === "error";
+    metadata.status === "completed" || metadata.status === "partial" || metadata.status === "error";
   if (options?.renderPrompt !== false) {
     const prompt = await readStoredPrompt(sessionId);
     if (prompt) {

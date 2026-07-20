@@ -1633,11 +1633,112 @@ describe("Deep Research iframe helpers", () => {
     );
   });
 
-  it("resolves a request-WEB report turn through its matching active Deep Research branch", async () => {
+  it("backs off and retries a rate-limited conversation-record lookup", async () => {
+    const scheduledDelays: number[] = [];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: (name: string) => (name.toLowerCase() === "retry-after" ? "0" : null) },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          current_node: "final-message",
+          mapping: {
+            "user-message": {
+              parent: null,
+              message: {
+                id: "user-message",
+                author: { role: "user" },
+                metadata: { deep_research_version: "standard", request_id: "request-1" },
+              },
+            },
+            "owner-message": {
+              parent: "user-message",
+              message: {
+                id: "owner-message",
+                author: { role: "assistant" },
+                recipient: "api_tool.call_tool",
+                end_turn: false,
+                metadata: { model_slug: "gpt-5-5-instant", request_id: "request-1" },
+              },
+            },
+            "final-message": {
+              parent: "owner-message",
+              message: {
+                id: "final-message",
+                author: { role: "assistant" },
+                end_turn: true,
+                metadata: { request_id: "request-1" },
+              },
+            },
+          },
+        }),
+      });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 10_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout: () => undefined,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout: (callback: () => void, delayMs: number) => {
+        scheduledDelays.push(delayMs);
+        queueMicrotask(callback);
+        return 1;
+      },
+    });
+
+    expect(result).toMatchObject({
+      messageId: "owner-message",
+      finalMessageId: "final-message",
+      metadataSource: "chatgpt-conversation-record",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(scheduledDelays).toContain(250);
+  });
+
+  it("does not hammer a rate-limited record endpoint when Retry-After is absent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ accessToken: "token" }) })
+      .mockResolvedValueOnce({ ok: false, status: 429, headers: { get: () => null } });
+
+    const result = await new vm.Script(
+      buildDeepResearchConversationRecordMetadataExpressionForTest("owner-message", 10_000),
+    ).runInNewContext({
+      AbortController,
+      clearTimeout,
+      encodeURIComponent,
+      fetch: fetchMock,
+      location: {
+        protocol: "https:",
+        hostname: "chatgpt.com",
+        port: "",
+        pathname: "/c/conversation-id",
+      },
+      setTimeout,
+    });
+
+    expect(result).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("resolves an attachment-bearing request-WEB turn by exact submitted user message ID", async () => {
     const token = "sensitive-browser-token";
     const userTurn = {
-      innerText: "Deep research\nTest scientific prompt",
-      textContent: "Deep research\nTest scientific prompt",
+      innerText: "observation.txt\nDocument\nDeep research\nTest scientific prompt",
+      textContent: "observation.txt\nDocument\nDeep research\nTest scientific prompt",
       getAttribute: (name: string) => {
         if (name === "data-turn") return "user";
         if (name === "data-message-id") return "user-message";
@@ -1721,7 +1822,12 @@ describe("Deep Research iframe helpers", () => {
       });
 
     const result = (await new vm.Script(
-      buildDeepResearchActiveRecordMetadataExpressionForTest(1, 1_000),
+      buildDeepResearchActiveRecordMetadataExpressionForTest(
+        1,
+        1_000,
+        "conversation-id",
+        "user-message",
+      ),
     ).runInNewContext({
       AbortController,
       clearTimeout,
@@ -4058,15 +4164,10 @@ describe("waitForDeepResearchCompletion", () => {
                 id: "sandbox",
                 url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
               },
-              childFrames: [
-                {
-                  frame: {
-                    id: "root-frame",
-                    name: "root",
-                    url: "https://connector_openai_deep_research.web-sandbox.oaiusercontent.com/",
-                  },
-                },
-              ],
+              // Production shape observed 2026-07-20: the confirmed connector
+              // OOPIF is an empty shell and the report app is rendered in an
+              // unnamed about:blank child frame.
+              childFrames: [{ frame: { id: "root-frame", url: "about:blank" } }],
             },
           };
         }
@@ -4170,6 +4271,11 @@ describe("waitForDeepResearchCompletion", () => {
       "DOM.getFrameOwner",
       { frameId: "sandbox" },
       undefined,
+    );
+    expect(mockClient.send).toHaveBeenCalledWith(
+      "Page.createIsolatedWorld",
+      expect.objectContaining({ frameId: "root-frame" }),
+      "deep-session",
     );
   });
 

@@ -6,6 +6,8 @@
 
 - CLI: avoid inheriting `browser.thinkingTime` from config when `--browser-model-strategy current` is explicit, while preserving an explicit `--browser-thinking-time` override. Thanks @jung0han!
 - Browser: preserve successful same-path attachment outputs while preventing failed references proven to be exact submitted inputs, including recorded bundle members, from being misclassified as missing generated artifacts and blocking conversation archiving; ambiguous and genuine unsaved outputs remain fail-closed.
+- Browser: capture completed Deep Research reports across every frame inside ChatGPT's confirmed connector target, bind attachment-bearing `request-WEB` turns through the exact persisted user-message ID, and conservatively back off rate-limited authenticated provenance lookups instead of renewing the limit; exact conversation-turn ownership and citation verification remain required.
+- Browser/session recovery: make reattach ownership single-flight and crash-reclaimable per session, recover abrupt-loss copied-profile runs only through their exact surviving Chrome/profile with no fresh-browser fallback, clean up only after required artifacts persist, preserve salvageable browser state when they do not, and terminalize unrecoverable sessions instead of leaving them falsely running; agent guidance now waits on the original command handle instead of spawning repeated reattach processes.
 
 ## 0.16.0 — 2026-07-12
 

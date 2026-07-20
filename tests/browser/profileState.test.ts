@@ -4,7 +4,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as profileState from "../../src/browser/profileState.js";
 
 describe("profileState", () => {
@@ -189,6 +189,18 @@ describe("profileState", () => {
         dir,
       ),
     ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=${dir}-attacker`,
+        dir,
+      ),
+    ).toBe(false);
+    expect(
+      profileState.isChromeCommandForUserDataDirForTest(
+        '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir="/tmp/profile with spaces"',
+        "/tmp/profile with spaces",
+      ),
+    ).toBe(true);
     expect(profileState.isChromeCommandForUserDataDirForTest("node worker.js", dir)).toBe(false);
   });
 
@@ -196,15 +208,154 @@ describe("profileState", () => {
     const dir = "/Users/example/.oracle/browser-profile";
     const processList = `
       123 node worker.js
-      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=64305 --user-data-dir=${dir} about:blank
+      456 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=64304 --user-data-dir=${dir}-attacker about:blank
+      457 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=64305 --user-data-dir=${dir} about:blank
       789 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222 --user-data-dir=/tmp/other
     `;
 
     expect(
       profileState.findChromeDebugTargetForProfileFromProcessListForTest(processList, dir),
     ).toEqual({
-      pid: 456,
+      pid: 457,
       port: 64305,
     });
+  });
+
+  test("validates, terminates, and removes only the exact copied-profile Chrome", async () => {
+    const sourceDir = await mkdtemp(path.join(os.tmpdir(), "oracle-source-profile-"));
+    const copiedDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-"));
+    const pid = 4242;
+    const port = 64321;
+    let alive = true;
+    try {
+      const identity = await profileState.validateExactCopiedProfileChrome(
+        {
+          userDataDir: copiedDir,
+          sourceUserDataDir: sourceDir,
+          copiedProfileRoot: path.dirname(copiedDir),
+          pid,
+          port,
+        },
+        {
+          findRunning: async () => ({ pid, port }),
+          probe: async () => ({ ok: true }),
+        },
+      );
+
+      expect(identity).toMatchObject({
+        userDataDir: copiedDir,
+        sourceUserDataDir: sourceDir,
+        copiedProfileRoot: path.dirname(copiedDir),
+        pid,
+        port,
+        host: "127.0.0.1",
+      });
+
+      await profileState.cleanupExactCopiedProfileChrome(identity, undefined, {
+        findRunning: async () => ({ pid, port }),
+        processAlive: () => alive,
+        terminate: async () => {
+          alive = false;
+          return true;
+        },
+        waitForExit: async () => {},
+        chromeUsesProfile: async () => false,
+      });
+
+      expect(alive).toBe(false);
+      expect(existsSync(copiedDir)).toBe(false);
+      expect(existsSync(sourceDir)).toBe(true);
+    } finally {
+      await rm(copiedDir, { recursive: true, force: true });
+      await rm(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves a copied profile when the persisted Chrome identity mismatches", async () => {
+    const sourceDir = await mkdtemp(path.join(os.tmpdir(), "oracle-source-profile-"));
+    const copiedDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-"));
+    const pid = 4242;
+    const port = 64322;
+    try {
+      const identity = await profileState.validateExactCopiedProfileChrome(
+        {
+          userDataDir: copiedDir,
+          sourceUserDataDir: sourceDir,
+          copiedProfileRoot: path.dirname(copiedDir),
+          pid,
+          port,
+        },
+        {
+          findRunning: async () => ({ pid, port }),
+          probe: async () => ({ ok: true }),
+        },
+      );
+
+      await expect(
+        profileState.cleanupExactCopiedProfileChrome({ ...identity, port: port + 1 }, undefined, {
+          findRunning: async () => ({ pid, port }),
+        }),
+      ).rejects.toThrow(/identity changed/i);
+      expect(existsSync(copiedDir)).toBe(true);
+    } finally {
+      await rm(copiedDir, { recursive: true, force: true });
+      await rm(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a copied profile that is not a direct child of its recorded root", async () => {
+    const sourceDir = await mkdtemp(path.join(os.tmpdir(), "oracle-source-profile-"));
+    const copiedProfileRoot = await mkdtemp(path.join(os.tmpdir(), "oracle-copy-root-"));
+    const nestedRoot = path.join(copiedProfileRoot, "nested");
+    await mkdir(nestedRoot);
+    const copiedDir = await mkdtemp(path.join(nestedRoot, "oracle-browser-"));
+    try {
+      await expect(
+        profileState.validateExactCopiedProfileChrome(
+          {
+            userDataDir: copiedDir,
+            sourceUserDataDir: sourceDir,
+            copiedProfileRoot,
+            pid: 4242,
+            port: 64323,
+          },
+          {
+            findRunning: async () => ({ pid: 4242, port: 64323 }),
+            probe: async () => ({ ok: true }),
+          },
+        ),
+      ).rejects.toThrow(/not a direct child/i);
+      expect(existsSync(copiedDir)).toBe(true);
+    } finally {
+      await rm(copiedProfileRoot, { recursive: true, force: true });
+      await rm(sourceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a non-loopback copied-profile DevTools host", async () => {
+    const sourceDir = await mkdtemp(path.join(os.tmpdir(), "oracle-source-profile-"));
+    const copiedDir = await mkdtemp(path.join(os.tmpdir(), "oracle-browser-"));
+    try {
+      await expect(
+        profileState.validateExactCopiedProfileChrome(
+          {
+            userDataDir: copiedDir,
+            sourceUserDataDir: sourceDir,
+            copiedProfileRoot: path.dirname(copiedDir),
+            pid: 4242,
+            port: 64324,
+            host: "attacker.invalid",
+          },
+          {
+            findRunning: async () => ({ pid: 4242, port: 64324 }),
+            probe: async () => ({ ok: true }),
+          },
+        ),
+      ).rejects.toThrow(/loopback DevTools host/i);
+      expect(existsSync(copiedDir)).toBe(true);
+    } finally {
+      await rm(copiedDir, { recursive: true, force: true });
+      await rm(sourceDir, { recursive: true, force: true });
+    }
   });
 });

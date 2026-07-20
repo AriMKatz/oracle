@@ -84,6 +84,20 @@ Notes:
 3. **Session integration** – browser sessions use the normal log writer, add `mode: "browser"` plus `browser.config/runtime` metadata, and persist Chrome pid/port or websocket attach metadata plus the Oracle-owned target/tab URL for reattach.
 4. **Usage accounting** – we estimate input tokens with the same tokenizer used for API runs and estimate output tokens via `estimateTokenCount`. `oracle status` therefore shows comparable cost/timing info even though the call ran through the browser.
 
+### Controller ownership and recovery
+
+Keep and poll the original command-runner handle while its saved controller PID
+is alive. In that state, `oracle session <id>` only observes the run; it does not
+take ownership. Once the controller is dead or the session is explicitly marked
+recoverable, invoke one `oracle session <id>` process and keep polling that
+process. Recovery ownership is single-flight per session, so concurrent callers
+remain observers and a stale recovery owner can be replaced only after its PID
+is dead. This coordination never serializes distinct browser sessions. Copied-
+profile recovery cleans up the exact orphaned Chrome/profile only after the
+required report and transcript persist locally; if that persistence fails, it
+terminalizes the session but preserves the exact browser state for evidence
+salvage.
+
 ### CLI Options
 
 - `--engine browser`: enables browser mode (legacy `--browser` remains as an alias for now). Without `--engine`, Oracle chooses API when `OPENAI_API_KEY` exists, otherwise browser.
@@ -110,7 +124,7 @@ Notes:
 - `--browser-port <port>` (alias: `--browser-debug-port`; env: `ORACLE_BROWSER_PORT`/`ORACLE_BROWSER_DEBUG_PORT`): pin the DevTools port (handy on WSL/Windows firewalls). When omitted, a random open port is chosen.
 - `ORACLE_CHATGPT_ACCOUNT_EMAIL`: exact saved-account email to select if ChatGPT shows its “Welcome back” account picker. Set it on the machine running browser automation. Oracle never logs the address; without it, Oracle selects only a single unambiguous saved account and fails closed when several are present.
 - `--browser-no-cookie-sync`, `--browser-manual-login` (persistent automation profile + user-driven login), `--browser-headless`, `--browser-hide-window`, `--browser-keep-browser`, and the global `-v/--verbose` flag for detailed automation logs.
-- `--copy-profile <dir>`: copy a signed-in Chrome user-data directory (e.g. `"$HOME/Library/Application Support/Google/Chrome"`) to a throwaway profile and run against it, reusing your live ChatGPT session with no manual sign-in. Oracle copies the profile recorded as active in `Local State`; pass `--browser-chrome-profile <name>` to select another direct child profile. The copy is launched with the real Keychain (not mocked) so its encrypted cookies decrypt, and is always deleted afterward—including setup/launch failures, incomplete captures, Cloudflare challenges, and interrupts. Copied-profile runs cannot be kept or reattached. Not compatible with `--browser-keep-browser`, `--browser-manual-login`, `--browser-attach-running`, `--remote-chrome`, or `--remote-host`, and fails fast if the required `Local State` cannot be copied. macOS/Linux; requires `rsync`.
+- `--copy-profile <dir>`: copy a signed-in Chrome user-data directory (e.g. `"$HOME/Library/Application Support/Google/Chrome"`) to a throwaway profile and run against it, reusing your live ChatGPT session with no manual sign-in. Oracle copies the profile recorded as active in `Local State`; pass `--browser-chrome-profile <name>` to select another direct child profile. The copy is launched with the real Keychain (not mocked) so its encrypted cookies decrypt. Controller-managed completion, failures, and signals terminate Chrome and delete the copy normally. An abrupt controller death may instead leave the exact Chrome/profile orphaned; recovery may attach only to that saved live process, endpoint, target, and profile, never a fresh or substituted browser. Successful recovery terminates that Chrome and deletes the copy after required local artifacts persist; artifact-persistence failure terminalizes the session but preserves the exact browser state for evidence salvage, while identity or reachability failure becomes a terminal session error. Not compatible with `--browser-keep-browser`, `--browser-manual-login`, `--browser-attach-running`, `--remote-chrome`, or `--remote-host`, and fails fast if the required `Local State` cannot be copied. macOS/Linux; requires `rsync`.
 - `--browser-url`: override ChatGPT base URL if needed.
 - `--browser-attachments <auto|never|always>`: control how `--file` inputs are delivered in browser mode. Default `auto` pastes text contents inline up to ~60k characters and uploads larger or raw files. `never` requires inline-compatible text inputs and rejects raw/binary files.
 - `--browser-inline-files`: alias for `--browser-attachments never` (forces inline paste; never uploads attachments).
@@ -212,7 +226,7 @@ resolved. In contrast, browser authentication or picker-selection failure, and
 failure to verify the exact returned DOM model for a normal response, remain
 fail-closed errors.
 
-If ChatGPT initially exposes only `Called tool` / `Used tool`, Oracle treats that as an incomplete capture for Deep Research rather than a final answer. Reattach the existing session with `oracle session <id> --render` so Oracle can recover the lazy-loaded report from the existing Chrome tab; do not rerun the research unless the browser session is unrecoverable.
+If ChatGPT initially exposes only `Called tool` / `Used tool`, Oracle treats that as an incomplete capture for Deep Research rather than a final answer. Keep waiting on the original runner while its controller is alive. After that controller is dead or the session is explicitly recoverable, run one `oracle session <id> --render` process and keep waiting on it so Oracle can recover the lazy-loaded report from the exact existing Chrome tab; do not rerun the research unless the browser session is unrecoverable.
 
 Deep Research is browser-only. It does not use connected apps in v1; give it public-web scope, uploaded files, and any domain/source guidance in the prompt. For deep thinking over code or architecture without web search, prefer a normal browser run with a Pro/Thinking model and `--browser-thinking-time heavy`.
 

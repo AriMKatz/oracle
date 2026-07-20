@@ -924,6 +924,7 @@ function sanitizeResult(
     chromePid: undefined,
     chromePort: undefined,
     userDataDir: undefined,
+    copiedProfileRoot: undefined,
   };
 }
 

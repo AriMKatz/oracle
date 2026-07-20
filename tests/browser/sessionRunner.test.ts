@@ -52,6 +52,7 @@ describe("runBrowserSessionExecution", () => {
         {
           chromePort: 9999,
           chromeHost: "127.0.0.1",
+          copiedProfileRoot: "/tmp",
           chromeTargetId: "t-1",
           tabUrl: "https://chatgpt.com/c/foo",
           conversationId: "foo",
@@ -73,6 +74,7 @@ describe("runBrowserSessionExecution", () => {
         tookMs: 1000,
         answerTokens: 12,
         answerChars: 20,
+        copiedProfileRoot: "/tmp",
         conversationId: "foo",
         submittedUserMessageId: "user-message-1",
         submittedUserTurnIndex: 1,
@@ -124,6 +126,7 @@ describe("runBrowserSessionExecution", () => {
     });
     expect(result.runtime).toMatchObject({
       chromePid: undefined,
+      copiedProfileRoot: "/tmp",
       conversationId: "foo",
       submittedUserMessageId: "user-message-1",
       submittedUserTurnIndex: 1,
@@ -138,7 +141,12 @@ describe("runBrowserSessionExecution", () => {
       expect.objectContaining({ code: "browser-deep-research-provenance-incomplete" }),
     ]);
     expect(persistRuntimeHint).toHaveBeenCalledWith(
-      expect.objectContaining({ chromePort: 9999, chromeHost: "127.0.0.1", chromeTargetId: "t-1" }),
+      expect.objectContaining({
+        chromePort: 9999,
+        chromeHost: "127.0.0.1",
+        copiedProfileRoot: "/tmp",
+        chromeTargetId: "t-1",
+      }),
       expect.objectContaining({ resolvedLabel: "Pro", verified: true }),
     );
     expect(log).toHaveBeenCalled();

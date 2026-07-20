@@ -280,6 +280,28 @@ describe("session lifecycle", () => {
     expect(rawAfterList.status).toBe("error");
     expect(rawAfterList.errorMessage).toMatch(/chrome/i);
   });
+
+  test("lets a live recovery controller finish after closing its orphaned Chrome", async () => {
+    const meta = await sessionModule.initializeSession(
+      { prompt: "Browser recovery finalizing", model: "gpt-5.2-pro", mode: "browser" },
+      "/tmp/cwd",
+    );
+    await sessionModule.updateSessionMetadata(meta.id, {
+      status: "running",
+      mode: "browser",
+      browser: {
+        runtime: {
+          chromePid: 999999,
+          chromePort: 1,
+          chromeHost: "127.0.0.1",
+          controllerPid: process.pid,
+        },
+      },
+    });
+
+    const refreshed = await sessionModule.readSessionMetadata(meta.id);
+    expect(refreshed?.status).toBe("running");
+  });
 });
 
 describe("session listing and filtering", () => {

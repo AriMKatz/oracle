@@ -28,7 +28,12 @@ import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
 import { buildConversationTurnListExpression } from "./conversationTurns.js";
-import { cleanupStaleProfileState } from "./profileState.js";
+import {
+  cleanupExactCopiedProfileChrome,
+  cleanupStaleProfileState,
+  validateExactCopiedProfileChrome,
+  type ExactCopiedProfileChrome,
+} from "./profileState.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
   pickTarget,
@@ -55,7 +60,11 @@ import {
 } from "./actions/archiveConversation.js";
 
 export interface ReattachDeps {
-  listTargets?: () => Promise<TargetInfoLite[]>;
+  listTargets?: (connection?: {
+    host: string;
+    port: number;
+    browserWSEndpoint?: string;
+  }) => Promise<TargetInfoLite[]>;
   connect?: (options?: unknown) => Promise<ChromeClient>;
   waitForAssistantResponse?: typeof waitForAssistantResponse;
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
@@ -71,6 +80,8 @@ export interface ReattachDeps {
    */
   persistResultBeforeClose?: (result: ReattachResult) => Promise<boolean>;
   promptPreview?: string;
+  validateCopiedProfileChrome?: typeof validateExactCopiedProfileChrome;
+  cleanupCopiedProfileChrome?: typeof cleanupExactCopiedProfileChrome;
 }
 
 export interface ReattachResult {
@@ -83,34 +94,93 @@ export interface ReattachResult {
   archive?: BrowserArchiveResult;
 }
 
+class ReattachArtifactPersistenceError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ReattachArtifactPersistenceError";
+  }
+}
+
 export async function resumeBrowserSession(
   runtime: BrowserRuntimeMetadata,
   config: BrowserSessionConfig | undefined,
   logger: BrowserLogger,
   deps: ReattachDeps = {},
 ): Promise<ReattachResult> {
+  const copiedProfileSource = config?.copyProfileSource?.trim();
+  const requireExistingChrome = Boolean(copiedProfileSource);
   const recoverSession =
     deps.recoverSession ??
     (async (runtimeMeta, configMeta) =>
       resumeBrowserSessionViaNewChrome(runtimeMeta, configMeta, logger, deps));
   let closeAttachedConnection: (() => Promise<void>) | null = null;
+  let copiedProfileChrome: ExactCopiedProfileChrome | null = null;
+  let copiedProfileCleanupAttempted = false;
   const closeAttached = async (): Promise<void> => {
     const close = closeAttachedConnection;
     closeAttachedConnection = null;
     await close?.().catch(() => undefined);
   };
+  const cleanupCopiedProfile = async (): Promise<void> => {
+    if (!copiedProfileChrome || copiedProfileCleanupAttempted) return;
+    copiedProfileCleanupAttempted = true;
+    await (deps.cleanupCopiedProfileChrome ?? cleanupExactCopiedProfileChrome)(
+      copiedProfileChrome,
+      logger,
+    );
+  };
 
   if (!runtime.chromePort && !runtime.chromeBrowserWSEndpoint) {
+    if (requireExistingChrome) {
+      throw new Error(
+        "Copied-profile recovery requires the exact existing Chrome endpoint; fresh browser fallback is disabled.",
+      );
+    }
     logger("No running Chrome detected; reopening browser to locate the session.");
     return recoverSession(runtime, config);
   }
 
   try {
-    const liveRuntime = (await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime;
+    if (requireExistingChrome) {
+      const chromePid = runtime.chromePid;
+      const chromePort = runtime.chromePort;
+      const userDataDir = runtime.userDataDir?.trim();
+      const copiedProfileRoot = runtime.copiedProfileRoot?.trim();
+      if (!copiedProfileSource || !userDataDir || !copiedProfileRoot || !chromePid || !chromePort) {
+        throw new Error(
+          "Copied-profile recovery requires the persisted source profile, temporary user-data directory, copied-profile root, Chrome pid, and DevTools port.",
+        );
+      }
+      copiedProfileChrome = await (
+        deps.validateCopiedProfileChrome ?? validateExactCopiedProfileChrome
+      )({
+        userDataDir,
+        sourceUserDataDir: copiedProfileSource,
+        copiedProfileRoot,
+        pid: chromePid,
+        port: chromePort,
+        host: runtime.chromeHost,
+      });
+    }
+
+    // A copied-profile recovery is pinned to the persisted, validated process
+    // and port. Ordinary reattach may still refresh stale endpoint metadata.
+    const liveRuntime = requireExistingChrome
+      ? {
+          ...runtime,
+          chromeHost: copiedProfileChrome?.host,
+          chromePort: copiedProfileChrome?.port,
+          chromeBrowserWSEndpoint: undefined,
+        }
+      : ((await refreshAttachRuntime(runtime).catch(() => runtime)) ?? runtime);
     const host = liveRuntime.chromeHost ?? "127.0.0.1";
     const port =
       liveRuntime.chromePort ?? inferPortFromBrowserWSEndpoint(liveRuntime.chromeBrowserWSEndpoint);
-    const browserWSEndpoint = liveRuntime.chromeBrowserWSEndpoint ?? undefined;
+    // Copied-profile recovery must never trust a persisted websocket URL. The
+    // validated process identity owns the exact host+port transport.
+    const browserWSEndpoint = requireExistingChrome
+      ? undefined
+      : (liveRuntime.chromeBrowserWSEndpoint ?? undefined);
     const listTargets =
       deps.listTargets ??
       (async () =>
@@ -119,7 +189,11 @@ export async function resumeBrowserSession(
           port: port ?? 9222,
           browserWSEndpoint,
         })) as TargetInfoLite[]);
-    const targetList = (await listTargets()) as TargetInfoLite[];
+    const targetList = (await listTargets({
+      host,
+      port: port ?? 9222,
+      browserWSEndpoint,
+    })) as TargetInfoLite[];
     const target = pickTarget(targetList, liveRuntime);
     const connection =
       browserWSEndpoint && !deps.connect
@@ -249,7 +323,9 @@ export async function resumeBrowserSession(
         timeoutMs + 5_000,
         "Reattach Deep Research response timed out",
       );
-      return finishAttachedCapture(buildDeepResearchAnswerFields(researchResult));
+      const result = await finishAttachedCapture(buildDeepResearchAnswerFields(researchResult));
+      await cleanupCopiedProfile();
+      return result;
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const answer = await withTimeout(
@@ -273,13 +349,39 @@ export async function resumeBrowserSession(
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
 
-    return finishAttachedCapture({
+    const result = await finishAttachedCapture({
       answerText: aligned.answerText,
       answerMarkdown: aligned.answerMarkdown,
     });
+    await cleanupCopiedProfile();
+    return result;
   } catch (error) {
     await closeAttached();
     const message = error instanceof Error ? error.message : String(error);
+    if (requireExistingChrome) {
+      let cleanupFailure: string | null = null;
+      const preserveForArtifactRecovery = error instanceof ReattachArtifactPersistenceError;
+      if (!preserveForArtifactRecovery) {
+        try {
+          await cleanupCopiedProfile();
+        } catch (cleanupError) {
+          cleanupFailure =
+            cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        }
+      }
+      const cleanupSuffix = cleanupFailure
+        ? ` Copied-profile cleanup also failed (${cleanupFailure}).`
+        : preserveForArtifactRecovery
+          ? " Exact Chrome and copied profile were preserved because required local artifacts were not saved."
+          : "";
+      throw new Error(
+        `Exact copied-profile Chrome recovery failed (${message}); fresh browser fallback is disabled.${cleanupSuffix}`,
+        { cause: error },
+      );
+    }
+    if (error instanceof ReattachArtifactPersistenceError) {
+      throw error;
+    }
     logger(
       `Existing Chrome reattach failed (${message}); reopening browser to locate the session.`,
     );
@@ -592,7 +694,20 @@ async function finalizeReattachCapture({
 }): Promise<ReattachResult> {
   if (!persistResultBeforeClose) return result;
 
-  const requiredArtifactsSaved = await persistResultBeforeClose(result);
+  let requiredArtifactsSaved: boolean;
+  try {
+    requiredArtifactsSaved = await persistResultBeforeClose(result);
+  } catch (error) {
+    throw new ReattachArtifactPersistenceError(
+      "Required local artifact persistence failed before reattach completion.",
+      { cause: error },
+    );
+  }
+  if (!requiredArtifactsSaved) {
+    throw new ReattachArtifactPersistenceError(
+      "Required local artifacts were not saved before reattach completion.",
+    );
+  }
   const mode = config?.archiveConversations ?? "auto";
   // Reattach does not persist enough turn history to safely re-evaluate the
   // automatic one-shot/multi-turn policy. Honor only the user's explicit
@@ -623,19 +738,6 @@ async function finalizeReattachCapture({
         attempted: false,
         archived: false,
         reason: decision.reason,
-        conversationUrl,
-      },
-    };
-  }
-  if (!requiredArtifactsSaved) {
-    logger("[browser] ChatGPT archive skipped (artifact-save-failed).");
-    return {
-      ...result,
-      archive: {
-        mode: decision.mode,
-        attempted: false,
-        archived: false,
-        reason: "artifact-save-failed",
         conversationUrl,
       },
     };

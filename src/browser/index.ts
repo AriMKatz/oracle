@@ -1049,6 +1049,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       submittedUserMessageId,
       submittedUserTurnIndex,
       userDataDir,
+      copiedProfileRoot: usingCopiedProfile ? path.dirname(userDataDir) : undefined,
       controllerPid: process.pid,
     };
     try {
@@ -1862,6 +1863,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         chromePort: chrome.port,
         chromeHost,
         userDataDir,
+        copiedProfileRoot: usingCopiedProfile ? path.dirname(userDataDir) : undefined,
         chromeTargetId: lastTargetId,
         tabUrl: pinnedConversationUrl,
         conversationId: expectedConversationId,
@@ -2404,6 +2406,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromePort: chrome.port,
       chromeHost,
       userDataDir,
+      copiedProfileRoot: usingCopiedProfile ? path.dirname(userDataDir) : undefined,
       chromeTargetId: lastTargetId,
       tabUrl: submittedConversationUrl ?? lastUrl,
       conversationId:

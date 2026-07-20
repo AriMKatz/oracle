@@ -348,6 +348,7 @@ export async function runBrowserSessionExecution(
       chromeBrowserWSEndpoint: browserResult.chromeBrowserWSEndpoint,
       chromeProfileRoot: browserResult.chromeProfileRoot,
       userDataDir: browserResult.userDataDir,
+      copiedProfileRoot: browserResult.copiedProfileRoot,
       chromeTargetId: browserResult.chromeTargetId,
       tabUrl: browserResult.tabUrl,
       conversationId: browserResult.conversationId,

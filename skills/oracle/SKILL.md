@@ -58,7 +58,10 @@ required.
 2. Preview the bundle with `--dry-run` and `--files-report`.
 3. Run the substantive GPT-5.6 Pro request directly through the copied-profile
    path, or explicitly choose one of the alternate browser paths below.
-4. Verify the saved response evidence, then read the saved transcript.
+4. Keep the original command-runner process/session handle and poll that same
+   handle until Oracle exits. Do not replace a live controller with repeated
+   `oracle session` commands.
+5. Verify the saved response evidence, then read the saved transcript.
 
 ## Standing informed external-upload consent
 
@@ -313,16 +316,32 @@ sed -n '/^## Answer$/,$p' \
   ambiguous artifacts remain reportable failures and block archiving when
   unsaved.
 - List recent sessions with `oracle status --hours 72`.
-- Use `oracle session <id> --render` to replay a completed session or reattach
-  an eligible incomplete run.
+- While the saved controller process is alive, keep polling the original runner
+  handle. `oracle session <id>` is observation-only in that state; it does not
+  take over the run.
+- After the controller is dead or the session is explicitly marked recoverable,
+  invoke `oracle session <id> --render` once. Recovery is single-flight per
+  session: at most one live recovery controller owns it, and concurrent callers
+  only observe. A later caller may reclaim ownership only after the recovery
+  owner itself is dead.
 - Continue a completed browser conversation with
   `oracle --followup <completed-session-id> -p "<task>"`. A completed
   copied-profile session launches a fresh copy from its stored source
   configuration.
-- An incomplete copied-profile run cannot be reattached because its throwaway
-  Chrome copy is deleted.
-- An incomplete attach-running or remote-Chrome run can be reattached when its
-  saved runtime metadata still identifies a usable Chrome session.
+- A copied-profile run is recoverable only when abrupt controller loss leaves
+  the exact Chrome process, DevTools endpoint/target, and throwaway profile
+  recorded for that session alive and reachable. Never launch a fresh copied
+  profile, recopy `Profile 1`, switch to manual login, or attach another browser
+  as a recovery fallback. After successful capture, close the orphaned Chrome
+  and delete the throwaway profile. If required report/transcript persistence
+  fails, leave that exact Chrome/profile intact for evidence salvage and end the
+  session with an explicit terminal error. If exact identity or reachability
+  fails, preserve the diagnostics and terminalize the session. Never leave it
+  falsely running, substitute another browser, or rerun the research
+  automatically.
+- An incomplete attach-running or remote-Chrome run can be recovered under the
+  same single-flight rule when its saved runtime metadata still identifies the
+  exact usable Chrome session.
 - Use `--slug "<3-5 words>"` for readable session IDs.
 - Successful non-project browser one-shots are archived automatically by
   default; override with `--browser-archive never|always`.

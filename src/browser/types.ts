@@ -188,6 +188,8 @@ export interface BrowserRunResult {
   chromeBrowserWSEndpoint?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
+  /** Recorded parent directory that owns a throwaway copied Chrome profile. */
+  copiedProfileRoot?: string;
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;

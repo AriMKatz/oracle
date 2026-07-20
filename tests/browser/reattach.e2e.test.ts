@@ -574,4 +574,199 @@ describe("browser reattach end-to-end (simulated)", () => {
       setOracleHomeDirOverrideForTest(null);
     }
   }, 20_000);
+
+  test("hands dead-controller recovery to one owner while later callers only observe", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-owner-"));
+    const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");
+    setOracleHomeDirOverrideForTest(tmpHome);
+
+    try {
+      const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
+      const resumeMock = vi.mocked(resumeBrowserSession);
+      let releaseRecovery!: () => void;
+      let signalRecoveryStarted!: () => void;
+      const recoveryStarted = new Promise<void>((resolve) => {
+        signalRecoveryStarted = resolve;
+      });
+      const recoveryGate = new Promise<void>((resolve) => {
+        releaseRecovery = resolve;
+      });
+
+      const { sessionStore } = await import("../../src/sessionStore.js");
+      const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+      await sessionStore.ensureStorage();
+      const sessionMeta = await sessionStore.createSession(
+        {
+          prompt: "Single owner recovery prompt",
+          model: "gpt-5.2-pro",
+          mode: "browser",
+          browserConfig: {},
+        },
+        "/repo",
+      );
+      const deadController = spawn(process.execPath, ["-e", "process.exit(0)"], {
+        stdio: "ignore",
+      });
+      await once(deadController, "exit");
+      await sessionStore.updateModelRun(sessionMeta.id, "gpt-5.2-pro", {
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "running",
+        startedAt: new Date().toISOString(),
+        mode: "browser",
+        browser: {
+          config: {},
+          runtime: {
+            chromePort: 51559,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "t-owner",
+            tabUrl: "https://chatgpt.com/c/single-owner",
+            controllerPid: deadController.pid ?? undefined,
+          },
+        },
+      });
+      resumeMock.mockImplementation(async () => {
+        signalRecoveryStarted();
+        await recoveryGate;
+        return { answerText: "owned", answerMarkdown: "owned markdown" };
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const owner = attachSession(sessionMeta.id, {
+        suppressMetadata: true,
+        renderPrompt: false,
+      });
+      await recoveryStarted;
+      const claimed = await sessionStore.readSession(sessionMeta.id);
+      expect(claimed?.browser?.runtime?.controllerPid).toBe(process.pid);
+
+      const observer = attachSession(sessionMeta.id, {
+        suppressMetadata: true,
+        renderPrompt: false,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(resumeMock).toHaveBeenCalledTimes(1);
+
+      releaseRecovery();
+      await Promise.all([owner, observer]);
+      logSpy.mockRestore();
+
+      const updated = await sessionStore.readSession(sessionMeta.id);
+      expect(updated?.status).toBe("completed");
+      expect(updated?.response?.status).toBe("completed");
+      expect(resumeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true });
+      setOracleHomeDirOverrideForTest(null);
+    }
+  }, 20_000);
+
+  test("terminalizes copied-profile artifact persistence failure and does not retry it", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-failure-"));
+    const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");
+    setOracleHomeDirOverrideForTest(tmpHome);
+
+    try {
+      const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
+      const resumeMock = vi.mocked(resumeBrowserSession);
+      resumeMock.mockRejectedValue(
+        new Error(
+          "Required local artifacts were not saved; exact Chrome and copied profile were preserved.",
+        ),
+      );
+
+      const { sessionStore } = await import("../../src/sessionStore.js");
+      const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+      await sessionStore.ensureStorage();
+      const sessionMeta = await sessionStore.createSession(
+        {
+          prompt: "Attached evidence recovery prompt",
+          file: ["synthetic-observation.txt"],
+          model: "gpt-5.5-pro",
+          mode: "browser",
+          browserAttachments: "always",
+          browserConfig: {
+            copyProfileSource: "/source/chrome-profile",
+            researchMode: "deep",
+          },
+        },
+        "/repo",
+      );
+      const deadController = spawn(process.execPath, ["-e", "process.exit(0)"], {
+        stdio: "ignore",
+      });
+      await once(deadController, "exit");
+      const preservedRuntime = {
+        chromePid: 424_242,
+        chromePort: 51559,
+        chromeHost: "127.0.0.1",
+        userDataDir: "/tmp/oracle-browser-fixture",
+        copiedProfileRoot: "/tmp",
+        chromeTargetId: "t-copy",
+        tabUrl: "https://chatgpt.com/c/copied-orphan",
+        conversationId: "copied-orphan",
+        promptSubmitted: true,
+        submittedUserMessageId: "user-copy",
+        submittedUserTurnIndex: 1,
+        controllerPid: deadController.pid ?? undefined,
+      };
+      await sessionStore.updateModelRun(sessionMeta.id, "gpt-5.5-pro", {
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "running",
+        startedAt: new Date().toISOString(),
+        mode: "browser",
+        browser: {
+          config: {
+            copyProfileSource: "/source/chrome-profile",
+            researchMode: "deep",
+          },
+          runtime: preservedRuntime,
+        },
+        response: { status: "running" },
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await attachSession(sessionMeta.id, { suppressMetadata: true, renderPrompt: false });
+      const failed = await sessionStore.readSession(sessionMeta.id);
+      expect(failed?.status).toBe("error");
+      expect(failed?.completedAt).toBeTruthy();
+      expect(failed?.response).toEqual({
+        status: "incomplete",
+        incompleteReason: "controller-disconnected",
+      });
+      expect(failed?.error).toMatchObject({
+        category: "browser-automation",
+        details: {
+          stage: "reattach-failed",
+          reattachable: false,
+          recovery: "copied-profile-orphan",
+        },
+      });
+      expect(failed?.browser?.runtime).toMatchObject({
+        ...preservedRuntime,
+        controllerPid: process.pid,
+      });
+      expect(failed?.options.file).toEqual(["synthetic-observation.txt"]);
+      expect(failed?.options.browserAttachments).toBe("always");
+      expect(failed?.models?.find((run) => run.model === "gpt-5.5-pro")).toMatchObject({
+        status: "error",
+        response: {
+          status: "incomplete",
+          incompleteReason: "controller-disconnected",
+        },
+      });
+
+      await attachSession(sessionMeta.id, { suppressMetadata: true, renderPrompt: false });
+      logSpy.mockRestore();
+      expect(resumeMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true });
+      setOracleHomeDirOverrideForTest(null);
+    }
+  }, 20_000);
 });

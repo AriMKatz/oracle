@@ -1,6 +1,6 @@
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { delay } from "./utils.js";
@@ -80,6 +80,15 @@ export interface RunningChromeDebugTarget {
   port: number;
 }
 
+export interface ExactCopiedProfileChrome {
+  userDataDir: string;
+  sourceUserDataDir: string;
+  copiedProfileRoot: string;
+  pid: number;
+  port: number;
+  host: string;
+}
+
 export async function findRunningChromeDebugTargetForProfile(
   userDataDir: string,
 ): Promise<RunningChromeDebugTarget | null> {
@@ -109,7 +118,7 @@ function findChromeDebugTargetForProfileFromProcessList(
     const lower = command.toLowerCase();
     if (!Number.isFinite(pid) || pid <= 0) continue;
     if (!lower.includes("chrome") && !lower.includes("chromium")) continue;
-    if (!lower.includes("user-data-dir") || !command.includes(userDataDir)) continue;
+    if (!hasExactCommandFlagValue(command, "--user-data-dir", userDataDir)) continue;
     const portMatch = command.match(/--remote-debugging-port(?:=|\s+)(\d+)/);
     const port = Number.parseInt(portMatch?.[1] ?? "", 10);
     if (!Number.isFinite(port) || port <= 0) continue;
@@ -130,7 +139,18 @@ export async function terminateRecordedChromeForProfile(
   logger?: ProfileStateLogger,
 ): Promise<boolean> {
   const pid = await readChromePid(userDataDir);
-  if (!pid || !isProcessAlive(pid)) {
+  if (!pid) {
+    return false;
+  }
+  return terminateChromePidForProfile(pid, userDataDir, logger);
+}
+
+export async function terminateChromePidForProfile(
+  pid: number,
+  userDataDir: string,
+  logger?: ProfileStateLogger,
+): Promise<boolean> {
+  if (!isProcessAlive(pid)) {
     return false;
   }
   const command = await readProcessCommand(pid);
@@ -149,14 +169,255 @@ export async function terminateRecordedChromeForProfile(
   }
 }
 
+export async function validateExactCopiedProfileChrome(
+  input: {
+    userDataDir: string;
+    sourceUserDataDir: string;
+    copiedProfileRoot: string;
+    pid: number;
+    port: number;
+    host?: string;
+  },
+  options: {
+    findRunning?: typeof findRunningChromeDebugTargetForProfile;
+    probe?: typeof verifyDevToolsReachable;
+  } = {},
+): Promise<ExactCopiedProfileChrome> {
+  const userDataDir = path.resolve(input.userDataDir);
+  const sourceUserDataDir = path.resolve(input.sourceUserDataDir);
+  const copiedProfileRoot = path.resolve(input.copiedProfileRoot);
+  await assertOwnedCopiedProfilePath(userDataDir, sourceUserDataDir, copiedProfileRoot);
+
+  if (!Number.isFinite(input.pid) || input.pid <= 0) {
+    throw new Error("Copied-profile recovery requires the persisted Chrome pid.");
+  }
+  if (!Number.isFinite(input.port) || input.port <= 0) {
+    throw new Error("Copied-profile recovery requires the persisted Chrome DevTools port.");
+  }
+
+  const running = await (options.findRunning ?? findRunningChromeDebugTargetForProfile)(
+    userDataDir,
+  );
+  if (!running) {
+    throw new Error(`No live Chrome process matches copied profile ${userDataDir}.`);
+  }
+  if (running.pid !== input.pid || running.port !== input.port) {
+    throw new Error(
+      `Copied-profile Chrome identity mismatch: expected pid ${input.pid} on port ${input.port}, found pid ${running.pid} on port ${running.port}.`,
+    );
+  }
+
+  const persistedHost = input.host?.trim() || "127.0.0.1";
+  if (!isLoopbackHost(persistedHost)) {
+    throw new Error(
+      `Copied-profile Chrome must use a loopback DevTools host; received ${persistedHost}.`,
+    );
+  }
+  const host = "127.0.0.1";
+  const probe = await (options.probe ?? verifyDevToolsReachable)({
+    host,
+    port: input.port,
+  });
+  if (!probe.ok) {
+    throw new Error(
+      `Copied-profile Chrome pid ${input.pid} is not reachable on ${host}:${input.port} (${probe.error}).`,
+    );
+  }
+
+  return {
+    userDataDir,
+    sourceUserDataDir,
+    copiedProfileRoot,
+    pid: input.pid,
+    port: input.port,
+    host,
+  };
+}
+
+export async function cleanupExactCopiedProfileChrome(
+  identity: ExactCopiedProfileChrome,
+  logger?: ProfileStateLogger,
+  options: {
+    gracefulWaitMs?: number;
+    forceWaitMs?: number;
+    findRunning?: typeof findRunningChromeDebugTargetForProfile;
+    processAlive?: typeof isProcessAlive;
+    terminate?: typeof terminateChromePidForProfile;
+    readCommand?: (pid: number) => Promise<string | null>;
+    kill?: (pid: number, signal: NodeJS.Signals) => void;
+    waitForExit?: (pid: number, timeoutMs: number) => Promise<void>;
+    chromeUsesProfile?: (userDataDir: string) => Promise<boolean>;
+    removeProfile?: (userDataDir: string) => Promise<void>;
+  } = {},
+): Promise<void> {
+  await assertOwnedCopiedProfilePath(
+    identity.userDataDir,
+    identity.sourceUserDataDir,
+    identity.copiedProfileRoot,
+  );
+
+  const findRunning = options.findRunning ?? findRunningChromeDebugTargetForProfile;
+  const processAlive = options.processAlive ?? isProcessAlive;
+  const terminate = options.terminate ?? terminateChromePidForProfile;
+  const readCommand = options.readCommand ?? readProcessCommand;
+  const kill = options.kill ?? ((pid, signal) => process.kill(pid, signal));
+  const waitForExit =
+    options.waitForExit ?? ((pid, timeoutMs) => waitForProcessExit(pid, timeoutMs, processAlive));
+  const chromeUsesProfile = options.chromeUsesProfile ?? isChromeUsingUserDataDir;
+  const removeProfile =
+    options.removeProfile ?? ((userDataDir) => rm(userDataDir, { recursive: true, force: true }));
+
+  const running = await findRunning(identity.userDataDir);
+  if (running && (running.pid !== identity.pid || running.port !== identity.port)) {
+    throw new Error(
+      `Refusing copied-profile cleanup after Chrome identity changed: expected pid ${identity.pid} on port ${identity.port}, found pid ${running.pid} on port ${running.port}.`,
+    );
+  }
+
+  if (processAlive(identity.pid)) {
+    if (!running) {
+      throw new Error(
+        `Refusing copied-profile cleanup because pid ${identity.pid} is alive but no longer matches ${identity.userDataDir}.`,
+      );
+    }
+    const terminated = await terminate(identity.pid, identity.userDataDir, logger);
+    if (!terminated) {
+      throw new Error(
+        `Refusing copied-profile cleanup because pid ${identity.pid} could not be verified and terminated.`,
+      );
+    }
+    await waitForExit(identity.pid, options.gracefulWaitMs ?? 5_000);
+  }
+
+  if (processAlive(identity.pid)) {
+    const command = await readCommand(identity.pid);
+    if (!isChromeCommandForUserDataDir(command, identity.userDataDir)) {
+      throw new Error(
+        `Refusing to force-terminate pid ${identity.pid} because it no longer matches ${identity.userDataDir}.`,
+      );
+    }
+    kill(identity.pid, "SIGKILL");
+    await waitForExit(identity.pid, options.forceWaitMs ?? 2_000);
+  }
+  if (processAlive(identity.pid)) {
+    throw new Error(
+      `Copied-profile Chrome pid ${identity.pid} did not exit; profile was preserved.`,
+    );
+  }
+  if (await chromeUsesProfile(identity.userDataDir)) {
+    throw new Error(
+      `Another Chrome process is using ${identity.userDataDir}; copied profile was preserved.`,
+    );
+  }
+
+  await removeProfile(identity.userDataDir);
+  logger?.(`Removed throwaway copied Chrome profile ${identity.userDataDir}`);
+}
+
+async function assertOwnedCopiedProfilePath(
+  userDataDir: string,
+  sourceUserDataDir: string,
+  copiedProfileRoot: string,
+): Promise<void> {
+  const resolvedUserDataDir = path.resolve(userDataDir);
+  const resolvedSourceUserDataDir = path.resolve(sourceUserDataDir);
+  const resolvedCopiedProfileRoot = path.resolve(copiedProfileRoot);
+  if (!path.basename(resolvedUserDataDir).startsWith("oracle-browser-")) {
+    throw new Error(
+      `Refusing copied-profile recovery for non-Oracle temporary path ${resolvedUserDataDir}.`,
+    );
+  }
+  const stat = await lstat(resolvedUserDataDir).catch(() => null);
+  if (!stat || !stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(
+      `Refusing copied-profile recovery because ${resolvedUserDataDir} is not a real directory.`,
+    );
+  }
+  const canonicalUserDataDir = await realpath(resolvedUserDataDir);
+  const rootStat = await lstat(resolvedCopiedProfileRoot).catch(() => null);
+  if (!rootStat || !rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    throw new Error(
+      `Refusing copied-profile recovery because recorded root ${resolvedCopiedProfileRoot} is not a real directory.`,
+    );
+  }
+  const canonicalCopiedProfileRoot = await realpath(resolvedCopiedProfileRoot);
+  if (path.dirname(canonicalUserDataDir) !== canonicalCopiedProfileRoot) {
+    throw new Error(
+      `Refusing copied-profile recovery because ${canonicalUserDataDir} is not a direct child of recorded root ${canonicalCopiedProfileRoot}.`,
+    );
+  }
+  const canonicalSourceUserDataDir = await realpath(resolvedSourceUserDataDir).catch(
+    () => resolvedSourceUserDataDir,
+  );
+  if (canonicalUserDataDir === canonicalSourceUserDataDir) {
+    throw new Error("Refusing to treat the source Chrome profile as a throwaway copied profile.");
+  }
+}
+
+async function waitForProcessExit(
+  pid: number,
+  timeoutMs: number,
+  processAlive: (pid: number) => boolean = isProcessAlive,
+): Promise<void> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  while (processAlive(pid) && Date.now() < deadline) {
+    await delay(Math.min(50, Math.max(1, deadline - Date.now())));
+  }
+}
+
 function isChromeCommandForUserDataDir(command: string | null, userDataDir: string): boolean {
   if (!command) return false;
   const lower = command.toLowerCase();
-  return (
-    (lower.includes("chrome") || lower.includes("chromium")) &&
-    lower.includes("user-data-dir") &&
-    command.includes(userDataDir)
-  );
+  if (
+    (!lower.includes("chrome") && !lower.includes("chromium")) ||
+    !lower.includes("user-data-dir")
+  ) {
+    return false;
+  }
+  return hasExactCommandFlagValue(command, "--user-data-dir", userDataDir);
+}
+
+function hasExactCommandFlagValue(command: string, flag: string, expectedValue: string): boolean {
+  let searchFrom = 0;
+  while (searchFrom < command.length) {
+    const flagIndex = command.indexOf(flag, searchFrom);
+    if (flagIndex < 0) return false;
+    const preceding = command[flagIndex - 1];
+    if (flagIndex > 0 && preceding && !/\s/u.test(preceding)) {
+      searchFrom = flagIndex + flag.length;
+      continue;
+    }
+    let valueStart = flagIndex + flag.length;
+    if (command[valueStart] === "=") {
+      valueStart += 1;
+    } else {
+      const whitespace = command.slice(valueStart).match(/^\s+/u)?.[0];
+      if (!whitespace) {
+        searchFrom = flagIndex + flag.length;
+        continue;
+      }
+      valueStart += whitespace.length;
+    }
+    const quote = command[valueStart];
+    if (quote === '"' || quote === "'") {
+      const valueEnd = command.indexOf(quote, valueStart + 1);
+      if (valueEnd >= 0 && command.slice(valueStart + 1, valueEnd) === expectedValue) {
+        return true;
+      }
+    } else if (command.startsWith(expectedValue, valueStart)) {
+      const following = command[valueStart + expectedValue.length];
+      if (following === undefined || /\s/u.test(following)) {
+        return true;
+      }
+    }
+    searchFrom = flagIndex + flag.length;
+  }
+  return false;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase().replace(/^\[|\]$/gu, "");
+  return normalized === "127.0.0.1" || normalized === "localhost" || normalized === "::1";
 }
 
 export function isChromeCommandForUserDataDirForTest(
@@ -417,12 +678,11 @@ async function isChromeUsingUserDataDir(userDataDir: string): Promise<boolean> {
       maxBuffer: 10 * 1024 * 1024,
     });
     const lines = String(stdout ?? "").split("\n");
-    const needle = userDataDir;
     for (const line of lines) {
       if (!line) continue;
       const lower = line.toLowerCase();
       if (!lower.includes("chrome") && !lower.includes("chromium")) continue;
-      if (line.includes(needle) && lower.includes("user-data-dir")) {
+      if (hasExactCommandFlagValue(line, "--user-data-dir", userDataDir)) {
         return true;
       }
     }

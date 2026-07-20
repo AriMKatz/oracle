@@ -110,6 +110,17 @@ The fork owns the local execution contract:
   archiving;
 - distinct copied-profile browser reviews may run concurrently, and an
   unrelated running session never requires waiting, serialization, or reuse;
+- each browser session has one live controller at a time: while the saved
+  controller remains alive, callers wait on the original runner handle and
+  `oracle session` is observation-only; after controller loss, recovery is
+  claimed atomically by at most one live process and concurrent callers remain
+  observers;
+- copied-profile recovery is allowed only when abrupt controller loss leaves
+  the exact saved throwaway Chrome/profile live and reachable; recovery never
+  launches or substitutes a browser/profile, cleans up that Chrome/profile only
+  after required local artifacts persist, preserves it for evidence salvage if
+  that persistence fails, and terminalizes an unrecoverable session with
+  explicit diagnostics instead of leaving it falsely running;
 - API-oriented CLI guidance does not govern browser-session concurrency or
   alter the installed skill's browser-only procedure.
 
@@ -156,6 +167,10 @@ concrete shared-browser conflict as scoped to that prompt or resource; never
 infer a global prohibition on distinct browser sessions. In particular,
 upstream help that warns against starting another API run does not require
 serializing independent browser reviews.
+
+Keep controller ownership and recovery guidance in the installed skill as
+executor-side procedure, never as Oracle prompt content. Recovery coordination
+is scoped to one session and must never serialize distinct browser reviews.
 
 ### Deployment authority
 
@@ -237,7 +252,9 @@ application would weaken the local contract. Typical examples include:
   evidence: returned-DOM `gpt-5-6-pro` for a normal response, or separate
   verified picker, selected/default, owner/orchestration, and resolved fields
   for Deep Research;
-- recovery changes that assume a deleted throwaway profile can be reattached;
+- recovery changes that recreate a deleted throwaway profile, launch a fresh
+  browser, or attach by ambiguous runtime hints instead of the exact saved live
+  copied-profile browser;
 - defaults that silently select API mode or another model;
 - changes that combine copied-profile mode with incompatible browser options.
 
@@ -267,6 +284,11 @@ Reject an upstream effect—or omit that part of a mixed change—when it would:
   review context;
 - serialize distinct browser reviews solely because another Oracle session is
   running, or reinterpret API-specific guidance as a browser concurrency ban;
+- permit concurrent recovery controllers for one session or recommend repeated
+  `oracle session` processes while that session's original controller is alive;
+- recover a copied-profile session through a fresh or substituted browser or
+  profile, delete its only salvageable browser state before required local
+  artifacts persist, or leave an impossible recovery falsely marked as running;
 - create important behavior that is absent from the canonical fork.
 
 Security fixes must not be rejected merely because they touch protected code.

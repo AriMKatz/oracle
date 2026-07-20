@@ -1866,35 +1866,84 @@ function buildDeepResearchConversationRecordMetadataExpression(
       // This runs inside the user's authenticated ChatGPT page. The bearer token
       // never leaves that browser context; only the compact, allowlisted turn
       // metadata below is returned over CDP.
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), ${JSON.stringify(timeoutMs)});
+      const deadline = Date.now() + ${JSON.stringify(timeoutMs)};
+      const fetchBeforeDeadline = async (url, options) => {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) return null;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), remainingMs);
+        try {
+          return await fetch(url, { ...options, signal: controller.signal });
+        } finally {
+          clearTimeout(timeout);
+        }
+      };
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const retryAfterMs = (response) => {
+        const raw = response?.headers?.get?.('retry-after');
+        if (typeof raw === 'string' && raw.trim()) {
+          const seconds = Number(raw.trim());
+          if (Number.isFinite(seconds) && seconds >= 0) {
+            return Math.min(60_000, Math.max(250, Math.ceil(seconds * 1_000)));
+          }
+          const retryDate = Date.parse(raw);
+          if (Number.isFinite(retryDate)) {
+            return Math.min(60_000, Math.max(250, retryDate - Date.now()));
+          }
+        }
+        // ChatGPT currently omits Retry-After on this endpoint. A short
+        // exponential retry train renews the rate-limit window indefinitely,
+        // so use one conservative request per minute when the server gives no
+        // more precise instruction.
+        return 60_000;
+      };
+      // Persist the server-directed cooldown in the page main world so a later
+      // outer poll cannot immediately undo the backoff after this lookup exits.
+      const cooldownKey = '__oracleDeepResearchRecordRetryAt';
+      const waitForCooldown = async () => {
+        const retryAt = Number(globalThis[cooldownKey] || 0);
+        const waitMs = Math.max(0, retryAt - Date.now());
+        if (waitMs <= 0) return true;
+        if (Date.now() + waitMs >= deadline) return false;
+        await sleep(waitMs);
+        return true;
+      };
+      if (!(await waitForCooldown())) return null;
       let record;
-      try {
-        const authResponse = await fetch('/api/auth/session', {
-          credentials: 'same-origin',
-          cache: 'no-store',
-          redirect: 'error',
-          signal: controller.signal,
-        });
-        if (!authResponse.ok) return null;
-        const auth = await authResponse.json();
-        const accessToken = asString(auth?.accessToken);
-        if (!accessToken) return null;
-        const recordResponse = await fetch(
+      const authResponse = await fetchBeforeDeadline('/api/auth/session', {
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+      });
+      if (!authResponse?.ok) return null;
+      const auth = await authResponse.json();
+      const accessToken = asString(auth?.accessToken);
+      if (!accessToken) return null;
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        const recordResponse = await fetchBeforeDeadline(
           '/backend-api/conversation/' + encodeURIComponent(conversationId),
           {
             credentials: 'same-origin',
             cache: 'no-store',
             redirect: 'error',
-            signal: controller.signal,
             headers: { authorization: 'Bearer ' + accessToken },
           },
         );
-        if (!recordResponse.ok) return null;
-        record = await recordResponse.json();
-      } finally {
-        clearTimeout(timeout);
+        if (!recordResponse) return null;
+        if (recordResponse.ok) {
+          record = await recordResponse.json();
+          globalThis[cooldownKey] = 0;
+          break;
+        }
+        if (recordResponse.status !== 429) return null;
+        const waitMs = retryAfterMs(recordResponse);
+        globalThis[cooldownKey] = Math.max(
+          Number(globalThis[cooldownKey] || 0),
+          Date.now() + waitMs,
+        );
+        if (attempt >= 5 || !(await waitForCooldown())) return null;
       }
+      if (!record) return null;
       const mapping = record?.mapping;
       if (!mapping || typeof mapping !== 'object') return null;
 
@@ -1960,10 +2009,18 @@ function buildDeepResearchConversationRecordMetadataExpression(
         );
         const matchingBranchUsers = branchUsers.filter((node) => {
           const message = node?.message;
+          const messageId = asString(message?.id);
+          const exactSubmittedUserBinding = Boolean(
+            expectedUserMessageId &&
+            messageId === expectedUserMessageId &&
+            priorUserMessageIds.includes(expectedUserMessageId)
+          );
           return Boolean(
-            priorUserMessageIds.includes(asString(message?.id)) &&
+            messageId &&
+            priorUserMessageIds.includes(messageId) &&
             asString(message?.metadata?.deep_research_version) &&
-            normalizePromptComparable(messageText(message)) === priorDomText
+            (exactSubmittedUserBinding ||
+              normalizePromptComparable(messageText(message)) === priorDomText)
           );
         });
         // The prior visible user turn must name exactly one record message on
@@ -2125,7 +2182,7 @@ async function enrichDeepResearchTurnMetadataFromConversationRecord(
       {
         expression: buildDeepResearchConversationRecordMetadataExpression(
           messageId ?? null,
-          8_000,
+          75_000,
           messageId || typeof turnIndex !== "number" ? undefined : turnIndex,
           expectedConversationId,
           expectedUserMessageId,
@@ -2568,7 +2625,12 @@ async function readDeepResearchTargetSession(
     if (!isConfirmedDeepResearchTarget(targetUrl, frameTree?.frameTree)) {
       return { confirmed: false, read: null };
     }
-    const frameIds = collectDeepResearchFrameIds(frameTree?.frameTree);
+    // Once the page-scoped target itself is confirmed as the connector OOPIF,
+    // every frame below it belongs to that exact, turn-owned target. The live
+    // ChatGPT UI currently puts the rendered report in an unnamed
+    // `about:blank` child frame, so descriptor-only filtering silently reads
+    // the empty connector shell and misses the completed report.
+    const frameIds = collectConfirmedDeepResearchTargetFrameIds(frameTree?.frameTree);
     let best: DeepResearchFrameStatus | null = null;
 
     const addCitationEvidence = async (
@@ -2725,25 +2787,18 @@ function collectPageDeepResearchFrameIds(tree: DeepResearchFrameTree | undefined
   return ids;
 }
 
-function collectDeepResearchFrameIds(tree: DeepResearchFrameTree | undefined): string[] {
+function collectConfirmedDeepResearchTargetFrameIds(
+  tree: DeepResearchFrameTree | undefined,
+): string[] {
   if (!tree?.frame) {
     return [];
   }
   const ids: string[] = [];
-  const url = tree.frame.url ?? "";
-  const name = tree.frame.name ?? "";
-  if (
-    url.includes("connector_openai_deep_research") ||
-    url.includes("deep-research") ||
-    name.includes("deep-research") ||
-    name === "root"
-  ) {
-    if (tree.frame.id) {
-      ids.push(tree.frame.id);
-    }
+  if (tree.frame.id) {
+    ids.push(tree.frame.id);
   }
   for (const child of tree.childFrames ?? []) {
-    ids.push(...collectDeepResearchFrameIds(child));
+    ids.push(...collectConfirmedDeepResearchTargetFrameIds(child));
   }
   return ids;
 }

@@ -118,6 +118,8 @@ export interface BrowserRuntimeMetadata {
   chromeBrowserWSEndpoint?: string;
   chromeProfileRoot?: string;
   userDataDir?: string;
+  /** Recorded parent directory that owns a throwaway copied Chrome profile. */
+  copiedProfileRoot?: string;
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
@@ -990,6 +992,13 @@ async function markDeadBrowser(
   }
   const runtime = meta.browser?.runtime;
   if (!runtime) {
+    return meta;
+  }
+  // A live controller owns the transition to a terminal state. In particular,
+  // reattach finalization may close an orphaned Chrome immediately before it
+  // persists completion; observers must not misclassify that short cleanup
+  // window as a failed session.
+  if (runtime.controllerPid && isProcessAlive(runtime.controllerPid)) {
     return meta;
   }
   const signals: boolean[] = [];
