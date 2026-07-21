@@ -13,6 +13,7 @@ import { sessionStore, wait } from "../sessionStore.js";
 import { formatTokenCount, formatTokenValue } from "../oracle/runUtils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { resumeBrowserSession } from "../browser/reattach.js";
+import { missingNormalAssistantTurnEvidenceFields } from "../browser/assistantTurnEvidence.js";
 import {
   addDeepResearchPickerEvidenceWarning,
   replaceDeepResearchEvidenceWarnings,
@@ -420,6 +421,14 @@ export async function attachSession(
             },
           },
         );
+        if (!isDeepResearchBrowserSession(metadata)) {
+          const missingFields = missingNormalAssistantTurnEvidenceFields(result.assistantTurn);
+          if (missingFields.length > 0) {
+            throw new Error(
+              `Normal browser reattach returned incomplete exact assistant-turn evidence (${missingFields.join(", ")}); refusing to mark the session completed.`,
+            );
+          }
+        }
         const outputTokens = estimateTokenCount(result.answerMarkdown);
         const freshDeepResearchWarnings = isDeepResearchBrowserSession(metadata)
           ? addDeepResearchPickerEvidenceWarning(

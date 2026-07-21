@@ -143,7 +143,7 @@ oracle \
   --model gpt-5-pro \
   --browser-model-strategy select \
   --browser-archive auto \
-  --browser-timeout 60m \
+  --browser-timeout 120m \
   --heartbeat 30 \
   --slug "<3-5-word-slug>" \
   -p "<task>"

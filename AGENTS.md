@@ -10,7 +10,7 @@ Oracle-specific notes:
   standing informed external-upload consent; never inject those requirements
   into Oracle prompts or attachments.
 - ChatGPT project URLs: steipete@gmail.com -> https://chatgpt.com/g/g-p-691edc9fec088191b553a35093da1ea8-oracle/project; studpete@gmail.com -> https://chatgpt.com/g/g-p-69505ed97e3081918a275477a647a682/project. Prefer studpete URL if steipete project not found.
-- Pro browser runs: allow up to 10 minutes; never click "Answer now"; keep at least 1–2 Pro live tests (reattach must stay Pro); move other tests to faster models where safe.
+- Pro browser runs: allow up to 10 minutes for ordinary live smokes and up to 120 minutes for large full-context reviews; never click "Answer now"; keep at least 1–2 Pro live tests (reattach must stay Pro); move other tests to faster models where safe.
 - Live smoke tests: OpenAI live tests are opt-in. Run `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/openai-live.test.ts` with a real `OPENAI_API_KEY` when you need the background path; gpt-5-pro can take ~10 minutes.
 - Wait defaults: gpt-5-pro API runs detach by default; use `--wait` to stay attached. gpt-5.1 and browser runs block by default; every run prints `oracle session <id>` for reattach.
 - Session storage: Oracle stores session data under `~/.oracle`; delete it if you need a clean slate.
@@ -19,7 +19,7 @@ Oracle-specific notes:
 - Oracle CLI on Node 25: if `pnpm dlx @steipete/oracle --help` fails with a missing `node_sqlite3.node`, rebuild sqlite3 in the pnpm dlx cache using system Python: `PYTHON=/usr/bin/python3 /Users/steipete/Projects/oracle/runner npx node-gyp rebuild` from the sqlite3 package dir printed in the error, then rerun the command.
 - Before a release, skim manual smokes in `docs/manual-tests.md` and rerun any that cover your change surface (especially browser/serve paths).
 - If browser smokes echo the prompt (Instant), rerun with `--browser-keep-browser --verbose` in tmux, then inspect DOM with `pnpm tsx scripts/browser-tools.ts eval ...` to confirm assistant turns exist; we fixed a case by refreshing assistant snapshots post-send.
-- Browser “Pro thinking” gate: never click/auto-click ChatGPT’s “Answer now” button. Treat it as a placeholder and wait 10m–1h for the real assistant response (auto-clicking skips long thinking and changes behavior).
+- Browser “Pro thinking” gate: never click/auto-click ChatGPT’s “Answer now” button. Treat it as a placeholder and wait up to the configured browser deadline (as long as 120 minutes for large full-context reviews) for the real assistant response; auto-clicking skips long thinking and changes behavior.
 - Browser smokes should preserve Markdown (lists, fences); if output looks flattened or echoed, inspect the captured assistant turn via `browser-tools.ts eval` before shipping.
 - Working on Windows? Read and update `docs/windows-work.md` before you start.
 - Sparkle signing key lives at `/Users/steipete/Library/CloudStorage/Dropbox/Backup/Sparkle`; set `SPARKLE_PRIVATE_KEY_FILE` to that path when notarizing the notifier.

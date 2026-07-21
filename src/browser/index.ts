@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -46,7 +45,7 @@ import {
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
-import { cleanAssistantText } from "./actions/assistantResponse.js";
+import { buildAssistantTurnEvidence } from "./assistantTurnEvidence.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
 import { startThinkingStatusMonitor } from "./actions/thinkingStatus.js";
 import {
@@ -627,38 +626,6 @@ export interface BrowserConversationTurn {
   answerText: string;
   answerMarkdown: string;
   assistantTurn?: BrowserAssistantTurnEvidence;
-}
-
-function buildAssistantTurnEvidence(
-  snapshot: {
-    text?: string | null;
-    messageId?: string | null;
-    turnId?: string | null;
-    turnIndex?: number | null;
-    modelSlug?: string | null;
-  } | null,
-  responseText: string,
-  responseMarkdown: string,
-): BrowserAssistantTurnEvidence | undefined {
-  if (!snapshot) return undefined;
-  const normalizeText = (value: string): string =>
-    cleanAssistantText(value).replace(/\s+/g, " ").trim();
-  if (!snapshot.text || normalizeText(snapshot.text) !== normalizeText(responseText)) {
-    return undefined;
-  }
-  const messageId = snapshot.messageId?.trim() || undefined;
-  const turnId = snapshot.turnId?.trim() || undefined;
-  const turnIndex = typeof snapshot.turnIndex === "number" ? snapshot.turnIndex : undefined;
-  const modelSlug = snapshot.modelSlug?.trim() || undefined;
-  if (!messageId && !turnId && turnIndex === undefined && !modelSlug) return undefined;
-  return {
-    messageId,
-    turnId,
-    turnIndex,
-    modelSlug,
-    responseSha256: createHash("sha256").update(responseMarkdown.trim()).digest("hex"),
-    capturedAt: new Date().toISOString(),
-  };
 }
 
 function normalizeBrowserFollowUpPrompts(values: string[] | undefined): string[] {

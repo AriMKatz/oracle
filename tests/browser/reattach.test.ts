@@ -20,6 +20,16 @@ type FakeClient = {
   close: () => Promise<void> | void;
 };
 
+function exactAssistantSnapshot(text: string) {
+  return {
+    text,
+    messageId: "message-final",
+    turnId: "conversation-turn-final",
+    turnIndex: 3,
+    modelSlug: "gpt-5-6-pro",
+  };
+}
+
 describe("resumeBrowserSession", () => {
   test("selects target and captures markdown via stubs", async () => {
     const runtime = {
@@ -69,6 +79,7 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("Hello PATH plan")),
     });
 
     expect(result.answerMarkdown).toBe("markdown response");
@@ -137,6 +148,7 @@ describe("resumeBrowserSession", () => {
           meta: { messageId: "m1", turnId: "conversation-turn-1" },
         })),
         captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+        readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("reattached answer")),
         persistResultBeforeClose: vi.fn(async () => {
           order.push("persist");
           return true;
@@ -199,10 +211,17 @@ describe("resumeBrowserSession", () => {
       connect,
       waitForAssistantResponse,
       captureAssistantMarkdown,
+      readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("live reattach pro 123")),
       promptPreview: "live reattach pro 123",
     });
 
-    expect(waitForAssistantResponse).toHaveBeenCalledWith(expect.anything(), 2000, logger, 3);
+    expect(waitForAssistantResponse).toHaveBeenCalledWith(
+      expect.anything(),
+      2000,
+      logger,
+      3,
+      "abc",
+    );
   });
 
   test("uses Deep Research completion path when reattaching research sessions", async () => {
@@ -539,6 +558,7 @@ describe("resumeBrowserSession", () => {
           meta: { messageId: "m1", turnId: "conversation-turn-1" },
         })),
         captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+        readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("reattached answer")),
         persistResultBeforeClose: vi.fn(async () => {
           order.push("persist");
           return true;
@@ -558,6 +578,80 @@ describe("resumeBrowserSession", () => {
     });
     expect(cleanupCopiedProfileChrome).toHaveBeenCalledWith(identity, logger);
     expect(recoverSession).not.toHaveBeenCalled();
+  });
+
+  test("preserves exact copied-profile Chrome when final-turn evidence is incomplete", async () => {
+    const runtime = {
+      chromePid: 4242,
+      chromePort: 51559,
+      chromeHost: "127.0.0.1",
+      chromeTargetId: "target-1",
+      userDataDir: "/tmp/oracle-browser-copy",
+      copiedProfileRoot: "/tmp",
+      tabUrl: "https://chatgpt.com/c/abc",
+    };
+    const identity = {
+      userDataDir: runtime.userDataDir,
+      sourceUserDataDir: "/source/chrome-profile",
+      copiedProfileRoot: runtime.copiedProfileRoot,
+      pid: runtime.chromePid,
+      port: runtime.chromePort,
+      host: runtime.chromeHost,
+    };
+    const order: string[] = [];
+    const connect = vi.fn(async () => ({
+      Runtime: {
+        enable: vi.fn(),
+        evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+          if (expression === "location.href") return { result: { value: runtime.tabUrl } };
+          if (expression === "1+1") return { result: { value: 2 } };
+          return { result: { value: null } };
+        }),
+      },
+      DOM: { enable: vi.fn() },
+      close: vi.fn(async () => {
+        order.push("close");
+      }),
+    })) as unknown as (options?: unknown) => Promise<ChromeClient>;
+    const cleanupCopiedProfileChrome = vi.fn(async () => {
+      order.push("cleanup");
+    });
+    const persistResultBeforeClose = vi.fn(async () => {
+      order.push("persist");
+      return true;
+    });
+    const logger = vi.fn() as BrowserLogger;
+
+    await expect(
+      resumeBrowserSession(
+        runtime,
+        { copyProfileSource: identity.sourceUserDataDir, timeoutMs: 2_000 },
+        logger,
+        {
+          listTargets: vi.fn(async () => [
+            { targetId: "target-1", type: "page", url: runtime.tabUrl },
+          ]),
+          connect,
+          validateCopiedProfileChrome: vi.fn(async () => identity),
+          cleanupCopiedProfileChrome,
+          waitForAssistantResponse: vi.fn(async () => ({
+            text: "reattached answer",
+            html: "",
+            meta: { messageId: "m1", turnId: "conversation-turn-1" },
+          })),
+          captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+          readAssistantSnapshot: vi.fn(async () => ({
+            text: "reattached answer",
+            messageId: "message-final",
+          })),
+          persistResultBeforeClose,
+        },
+      ),
+    ).rejects.toThrow(/exact final assistant-turn evidence is incomplete.*preserved/i);
+
+    expect(order).toEqual(["close"]);
+    expect(persistResultBeforeClose).not.toHaveBeenCalled();
+    expect(cleanupCopiedProfileChrome).not.toHaveBeenCalled();
   });
 
   test("preserves exact copied-profile Chrome when required artifact persistence returns false", async () => {
@@ -623,6 +717,7 @@ describe("resumeBrowserSession", () => {
             meta: { messageId: "m1", turnId: "conversation-turn-1" },
           })),
           captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+          readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("reattached answer")),
           persistResultBeforeClose: vi.fn(async () => {
             order.push("persist");
             return false;
@@ -688,6 +783,7 @@ describe("resumeBrowserSession", () => {
           meta: { messageId: "m1", turnId: "conversation-turn-1" },
         })),
         captureAssistantMarkdown: vi.fn(async () => "reattached markdown"),
+        readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("reattached answer")),
       },
     );
 
@@ -822,6 +918,7 @@ describe("resumeBrowserSession", () => {
         connect,
         waitForAssistantResponse,
         captureAssistantMarkdown,
+        readAssistantSnapshot: vi.fn(async () => exactAssistantSnapshot("attached")),
       },
     );
 

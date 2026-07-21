@@ -26,7 +26,18 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue({ answerText: "ok text", answerMarkdown: "ok markdown" });
+      resumeMock.mockResolvedValue({
+        answerText: "ok text",
+        answerMarkdown: "ok markdown",
+        assistantTurn: {
+          messageId: "message-final",
+          turnId: "conversation-turn-final",
+          turnIndex: 3,
+          modelSlug: "gpt-5-6-pro",
+          responseSha256: createHash("sha256").update("ok markdown").digest("hex"),
+          capturedAt: "2026-07-21T20:00:00.000Z",
+        },
+      });
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -70,9 +81,73 @@ describe("browser reattach end-to-end (simulated)", () => {
       const updated = await sessionStore.readSession(sessionMeta.id);
       expect(updated?.status).toBe("completed");
       expect(updated?.response?.status).toBe("completed");
+      expect(updated?.browser?.runtime?.assistantTurn).toMatchObject({
+        messageId: "message-final",
+        turnIndex: 3,
+        modelSlug: "gpt-5-6-pro",
+        responseSha256: createHash("sha256").update("ok markdown").digest("hex"),
+      });
       expect(resumeMock).toHaveBeenCalledTimes(1);
       const runs = updated?.models ?? [];
       expect(runs.some((r) => r.status === "completed")).toBe(true);
+    } finally {
+      await fs.rm(tmpHome, { recursive: true, force: true });
+      setOracleHomeDirOverrideForTest(null);
+    }
+  }, 20_000);
+
+  test("refuses to mark a normal reattach completed without exact turn evidence", async () => {
+    const tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-reattach-"));
+    const { setOracleHomeDirOverrideForTest } = await import("../../src/oracleHome.js");
+    setOracleHomeDirOverrideForTest(tmpHome);
+
+    try {
+      const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
+      vi.mocked(resumeBrowserSession).mockResolvedValue({
+        answerText: "captured text",
+        answerMarkdown: "captured markdown",
+      });
+      const { sessionStore } = await import("../../src/sessionStore.js");
+      const { attachSession } = await import("../../src/cli/sessionDisplay.js");
+
+      await sessionStore.ensureStorage();
+      const sessionMeta = await sessionStore.createSession(
+        {
+          prompt: "Test prompt",
+          model: "gpt-5-pro",
+          mode: "browser",
+          browserConfig: {},
+        },
+        "/repo",
+      );
+      await sessionStore.updateModelRun(sessionMeta.id, "gpt-5-pro", {
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      await sessionStore.updateSession(sessionMeta.id, {
+        status: "running",
+        startedAt: new Date().toISOString(),
+        mode: "browser",
+        browser: {
+          config: {},
+          runtime: {
+            chromePort: 51559,
+            chromeHost: "127.0.0.1",
+            chromeTargetId: "t-1",
+            tabUrl: "https://chatgpt.com/c/demo",
+          },
+        },
+        response: { status: "running", incompleteReason: "chrome-disconnected" },
+      });
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await attachSession(sessionMeta.id, { suppressMetadata: true, renderPrompt: false });
+
+      const updated = await sessionStore.readSession(sessionMeta.id);
+      expect(updated?.status).toBe("error");
+      expect(updated?.response?.status).toBe("incomplete");
+      expect(updated?.browser?.runtime?.assistantTurn).toBeUndefined();
+      expect(updated?.errorMessage).toMatch(/incomplete exact assistant-turn evidence/i);
     } finally {
       await fs.rm(tmpHome, { recursive: true, force: true });
       setOracleHomeDirOverrideForTest(null);
@@ -140,7 +215,17 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue({ answerText: "ok text", answerMarkdown: "ok markdown" });
+      resumeMock.mockResolvedValue({
+        answerText: "ok text",
+        answerMarkdown: "ok markdown",
+        assistantTurn: {
+          messageId: "message-final",
+          turnIndex: 3,
+          modelSlug: "gpt-5-6-pro",
+          responseSha256: createHash("sha256").update("ok markdown").digest("hex"),
+          capturedAt: "2026-07-21T20:00:00.000Z",
+        },
+      });
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -408,7 +493,17 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue({ answerText: "ok text", answerMarkdown: "ok markdown" });
+      resumeMock.mockResolvedValue({
+        answerText: "ok text",
+        answerMarkdown: "ok markdown",
+        assistantTurn: {
+          messageId: "message-final",
+          turnIndex: 3,
+          modelSlug: "gpt-5-6-pro",
+          responseSha256: createHash("sha256").update("ok markdown").digest("hex"),
+          capturedAt: "2026-07-21T20:00:00.000Z",
+        },
+      });
 
       const { sessionStore } = await import("../../src/sessionStore.js");
       const { attachSession } = await import("../../src/cli/sessionDisplay.js");
@@ -484,7 +579,17 @@ describe("browser reattach end-to-end (simulated)", () => {
     try {
       const { resumeBrowserSession } = await import("../../src/browser/reattach.js");
       const resumeMock = vi.mocked(resumeBrowserSession);
-      resumeMock.mockResolvedValue({ answerText: "ok text", answerMarkdown: "ok markdown" });
+      resumeMock.mockResolvedValue({
+        answerText: "ok text",
+        answerMarkdown: "ok markdown",
+        assistantTurn: {
+          messageId: "message-final",
+          turnIndex: 3,
+          modelSlug: "gpt-5-6-pro",
+          responseSha256: createHash("sha256").update("ok markdown").digest("hex"),
+          capturedAt: "2026-07-21T20:00:00.000Z",
+        },
+      });
 
       const { registerTerminationHooks } = await import("../../src/browser/chromeLifecycle.js");
       const { sessionStore } = await import("../../src/sessionStore.js");
@@ -630,7 +735,17 @@ describe("browser reattach end-to-end (simulated)", () => {
       resumeMock.mockImplementation(async () => {
         signalRecoveryStarted();
         await recoveryGate;
-        return { answerText: "owned", answerMarkdown: "owned markdown" };
+        return {
+          answerText: "owned",
+          answerMarkdown: "owned markdown",
+          assistantTurn: {
+            messageId: "message-final",
+            turnIndex: 3,
+            modelSlug: "gpt-5-6-pro",
+            responseSha256: createHash("sha256").update("owned markdown").digest("hex"),
+            capturedAt: "2026-07-21T20:00:00.000Z",
+          },
+        };
       });
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 

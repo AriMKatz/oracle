@@ -15,6 +15,7 @@ import {
   ensureNotBlocked,
   ensureLoggedIn,
   ensurePromptReady,
+  readAssistantSnapshot,
 } from "./pageActions.js";
 import type { BrowserArchiveResult, BrowserLogger, ChromeClient } from "./types.js";
 import {
@@ -58,6 +59,10 @@ import {
   archiveChatGptConversation,
   resolveBrowserArchiveDecision,
 } from "./actions/archiveConversation.js";
+import {
+  buildAssistantTurnEvidence,
+  missingNormalAssistantTurnEvidenceFields,
+} from "./assistantTurnEvidence.js";
 
 export interface ReattachDeps {
   listTargets?: (connection?: {
@@ -68,6 +73,7 @@ export interface ReattachDeps {
   connect?: (options?: unknown) => Promise<ChromeClient>;
   waitForAssistantResponse?: typeof waitForAssistantResponse;
   captureAssistantMarkdown?: typeof captureAssistantMarkdown;
+  readAssistantSnapshot?: typeof readAssistantSnapshot;
   waitForDeepResearchCompletion?: typeof waitForDeepResearchCompletion;
   recoverSession?: (
     runtime: BrowserRuntimeMetadata,
@@ -98,6 +104,13 @@ class ReattachArtifactPersistenceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "ReattachArtifactPersistenceError";
+  }
+}
+
+class ReattachTurnEvidenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReattachTurnEvidenceError";
   }
 }
 
@@ -329,7 +342,13 @@ export async function resumeBrowserSession(
     }
     const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
     const answer = await withTimeout(
-      waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined),
+      waitForResponse(
+        Runtime,
+        timeoutMs,
+        logger,
+        minTurnIndex ?? undefined,
+        expectedConversationId,
+      ),
       timeoutMs + 5_000,
       "Reattach response timed out",
     );
@@ -348,11 +367,16 @@ export async function resumeBrowserSession(
         "Reattach markdown capture timed out",
       )) ?? recovered.text;
     const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
-
-    const result = await finishAttachedCapture({
+    const captured = await buildNormalReattachResult({
+      Runtime,
       answerText: aligned.answerText,
       answerMarkdown: aligned.answerMarkdown,
+      minTurnIndex,
+      expectedConversationId,
+      readSnapshot: deps.readAssistantSnapshot,
     });
+
+    const result = await finishAttachedCapture(captured);
     await cleanupCopiedProfile();
     return result;
   } catch (error) {
@@ -360,7 +384,9 @@ export async function resumeBrowserSession(
     const message = error instanceof Error ? error.message : String(error);
     if (requireExistingChrome) {
       let cleanupFailure: string | null = null;
-      const preserveForArtifactRecovery = error instanceof ReattachArtifactPersistenceError;
+      const preserveForArtifactRecovery =
+        error instanceof ReattachArtifactPersistenceError ||
+        error instanceof ReattachTurnEvidenceError;
       if (!preserveForArtifactRecovery) {
         try {
           await cleanupCopiedProfile();
@@ -372,7 +398,7 @@ export async function resumeBrowserSession(
       const cleanupSuffix = cleanupFailure
         ? ` Copied-profile cleanup also failed (${cleanupFailure}).`
         : preserveForArtifactRecovery
-          ? " Exact Chrome and copied profile were preserved because required local artifacts were not saved."
+          ? " Exact Chrome and copied profile were preserved because required local artifacts or exact assistant-turn evidence were not saved."
           : "";
       throw new Error(
         `Exact copied-profile Chrome recovery failed (${message}); fresh browser fallback is disabled.${cleanupSuffix}`,
@@ -598,7 +624,13 @@ async function resumeBrowserSessionViaNewChrome(
     return finishRecoveredCapture(buildDeepResearchAnswerFields(researchResult));
   }
   const promptEcho = buildPromptEchoMatcher(deps.promptPreview);
-  const answer = await waitForResponse(Runtime, timeoutMs, logger, minTurnIndex ?? undefined);
+  const answer = await waitForResponse(
+    Runtime,
+    timeoutMs,
+    logger,
+    minTurnIndex ?? undefined,
+    expectedConversationId,
+  );
   const recovered = await recoverPromptEcho(
     Runtime,
     answer,
@@ -609,11 +641,52 @@ async function resumeBrowserSessionViaNewChrome(
   );
   const markdown = (await captureMarkdown(Runtime, recovered.meta, logger)) ?? recovered.text;
   const aligned = alignPromptEchoMarkdown(recovered.text, markdown, promptEcho, logger);
+  let captured: ReattachResult;
+  try {
+    captured = await buildNormalReattachResult({
+      Runtime,
+      answerText: aligned.answerText,
+      answerMarkdown: aligned.answerMarkdown,
+      minTurnIndex,
+      expectedConversationId,
+      readSnapshot: deps.readAssistantSnapshot,
+    });
+  } catch (error) {
+    await cleanup();
+    throw error;
+  }
 
-  return finishRecoveredCapture({
-    answerText: aligned.answerText,
-    answerMarkdown: aligned.answerMarkdown,
-  });
+  return finishRecoveredCapture(captured);
+}
+
+async function buildNormalReattachResult({
+  Runtime,
+  answerText,
+  answerMarkdown,
+  minTurnIndex,
+  expectedConversationId,
+  readSnapshot,
+}: {
+  Runtime: ChromeClient["Runtime"];
+  answerText: string;
+  answerMarkdown: string;
+  minTurnIndex: number | null;
+  expectedConversationId?: string;
+  readSnapshot?: typeof readAssistantSnapshot;
+}): Promise<ReattachResult> {
+  const snapshot = await (readSnapshot ?? readAssistantSnapshot)(
+    Runtime,
+    minTurnIndex ?? undefined,
+    expectedConversationId,
+  ).catch(() => null);
+  const assistantTurn = buildAssistantTurnEvidence(snapshot, answerText, answerMarkdown);
+  const missingFields = missingNormalAssistantTurnEvidenceFields(assistantTurn);
+  if (missingFields.length > 0) {
+    throw new ReattachTurnEvidenceError(
+      `Exact final assistant-turn evidence is incomplete (${missingFields.join(", ")}); refusing to finalize normal browser reattach.`,
+    );
+  }
+  return { answerText, answerMarkdown, assistantTurn };
 }
 
 async function readPromptPreviewTurnIndex(
