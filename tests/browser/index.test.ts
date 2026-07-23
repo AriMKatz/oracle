@@ -76,6 +76,14 @@ describe("assistant turn evidence", () => {
 });
 
 describe("Deep Research submission scope", () => {
+  test("preserves a complete WEB conversation ID for runtime persistence", () => {
+    expect(
+      __test__.extractConversationIdFromUrl(
+        "https://chatgpt.com/c/WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef",
+      ),
+    ).toBe("WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef");
+  });
+
   test("freezes the first observed post-submit conversation ID", () => {
     expect(__test__.acceptsSubmittedConversationId(undefined, "submitted")).toBe(true);
     expect(__test__.acceptsSubmittedConversationId("submitted", "submitted")).toBe(true);

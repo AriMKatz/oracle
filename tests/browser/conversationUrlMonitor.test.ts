@@ -3,6 +3,19 @@ import { createConversationUrlMonitor } from "../../src/browser/conversationUrlM
 import type { BrowserLogger } from "../../src/browser/types.js";
 
 describe("createConversationUrlMonitor", () => {
+  test("persists a WEB conversation URL without truncating its path segment", async () => {
+    const url = "https://chatgpt.com/c/WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef";
+    const persistUrl = vi.fn(async () => {});
+    const monitor = createConversationUrlMonitor({
+      readUrl: async () => url,
+      persistUrl,
+      logger: vi.fn() as BrowserLogger,
+    });
+
+    await expect(monitor.update("post-submit", 1_000)).resolves.toBe(true);
+    expect(persistUrl).toHaveBeenCalledWith(url);
+  });
+
   test("persists a conversation URL that appears after prompt submission", async () => {
     const readUrl = vi
       .fn<() => Promise<string>>()

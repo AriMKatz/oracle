@@ -9,6 +9,7 @@
 - Browser: capture completed Deep Research reports across every frame inside ChatGPT's confirmed connector target, bind attachment-bearing `request-WEB` turns through the exact persisted user-message ID, and conservatively back off rate-limited authenticated provenance lookups instead of renewing the limit; exact conversation-turn ownership and citation verification remain required.
 - Browser/session recovery: make reattach ownership single-flight and crash-reclaimable per session, recover abrupt-loss copied-profile runs only through their exact surviving Chrome/profile with no fresh-browser fallback, clean up only after required artifacts persist, preserve salvageable browser state when they do not, and terminalize unrecoverable sessions instead of leaving them falsely running; agent guidance now waits on the original command handle instead of spawning repeated reattach processes.
 - Browser/session recovery: require normal-response reattach to persist exact final-turn identity, index, model slug, and response hash before marking a session completed or deleting a copied profile; incomplete evidence now fails closed with the exact browser state preserved, and large full-context Pro review guidance uses a 120-minute deadline.
+- Browser: preserve the complete ChatGPT `/c/` path segment, including `WEB:<uuid>` conversation IDs, across initial runtime persistence, Deep Research turn binding, reattach target selection, live-tab matching, cookie preservation, navigation, and archiving.
 
 ## 0.16.0 — 2026-07-12
 

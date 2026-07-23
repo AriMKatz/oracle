@@ -114,6 +114,7 @@ import {
   createConversationUrlMonitor,
   type ConversationUrlMonitor,
 } from "./conversationUrlMonitor.js";
+import { extractConversationIdFromUrl, isConversationUrl } from "./conversationIdentity.js";
 
 export type { BrowserAutomationConfig, BrowserRunOptions, BrowserRunResult } from "./types.js";
 export { CHATGPT_URL, DEFAULT_MODEL_STRATEGY, DEFAULT_MODEL_TARGET } from "./constants.js";
@@ -4016,6 +4017,7 @@ export const __test__ = {
   collectChatGptUiWarnings,
   createAssistantTimeoutError,
   detachKeptChromeProcess,
+  extractConversationIdFromUrl,
   formatManualLoginSetupCommand,
   isAssistantResponseTimeoutError,
   isManualLoginProfileInitialized,
@@ -4300,10 +4302,6 @@ async function readConversationTurnCount(
   return null;
 }
 
-function isConversationUrl(url: string): boolean {
-  return /\/c\/[a-z0-9-]+/i.test(url);
-}
-
 function describeDevtoolsFirewallHint(host: string, port: number): string | null {
   if (!isWsl()) return null;
   return [
@@ -4321,11 +4319,6 @@ function isWsl(): boolean {
   if (process.platform !== "linux") return false;
   if (process.env.WSL_DISTRO_NAME) return true;
   return os.release().toLowerCase().includes("microsoft");
-}
-
-function extractConversationIdFromUrl(url: string): string | undefined {
-  const match = url.match(/\/c\/([a-zA-Z0-9-]+)/);
-  return match?.[1];
 }
 
 async function resolveUserDataBaseDir(): Promise<string> {

@@ -156,4 +156,25 @@ describe("liveTabs helpers", () => {
       }),
     ).toBe(false);
   });
+
+  test("matches a live tab by its complete WEB conversation ID", () => {
+    const conversationId = "WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef";
+    const meta = {
+      id: "session-web",
+      createdAt: "2026-07-22T00:00:00.000Z",
+      status: "running",
+      options: {},
+      mode: "browser",
+      browser: { runtime: { chromePort: 9225, conversationId } },
+    } as SessionMetadata;
+
+    expect(
+      sessionMatchesTab(meta, {
+        host: "127.0.0.1",
+        port: 9225,
+        targetId: "target-web",
+        url: `https://chatgpt.com/c/${conversationId}`,
+      }),
+    ).toBe(true);
+  });
 });

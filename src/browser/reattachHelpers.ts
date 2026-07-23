@@ -1,6 +1,7 @@
 import type { BrowserLogger, ChromeClient } from "./types.js";
 import { CONVERSATION_TURN_SELECTOR } from "./constants.js";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
+import { extractConversationIdFromUrl } from "./conversationIdentity.js";
 import { delay } from "./utils.js";
 import { readAssistantSnapshot } from "./pageActions.js";
 
@@ -51,11 +52,7 @@ export function pickTarget(
   return targets.find((t) => t.type === "page") ?? targets[0];
 }
 
-export function extractConversationIdFromUrl(url: string): string | undefined {
-  if (!url) return undefined;
-  const match = url.match(/\/c\/([a-zA-Z0-9-]+)/);
-  return match?.[1];
-}
+export { extractConversationIdFromUrl } from "./conversationIdentity.js";
 
 export function buildConversationUrl(
   runtime: { tabUrl?: string; conversationId?: string },

@@ -995,6 +995,11 @@ describe("reattach helpers", () => {
 
   test("extracts conversation id from a chat URL", () => {
     expect(extractConversationIdFromUrl("https://chatgpt.com/c/abc-123")).toBe("abc-123");
+    expect(
+      extractConversationIdFromUrl(
+        "https://chatgpt.com/c/WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef",
+      ),
+    ).toBe("WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef");
     expect(extractConversationIdFromUrl("")).toBeUndefined();
   });
 
@@ -1008,6 +1013,12 @@ describe("reattach helpers", () => {
     expect(buildConversationUrl({ conversationId: "abc" }, "https://chatgpt.com/")).toBe(
       "https://chatgpt.com/c/abc",
     );
+    expect(
+      buildConversationUrl(
+        { conversationId: "WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef" },
+        "https://chatgpt.com/",
+      ),
+    ).toBe("https://chatgpt.com/c/WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef");
   });
 
   test("pickTarget prefers a saved conversation over a stale target id", () => {
@@ -1040,6 +1051,16 @@ describe("reattach helpers", () => {
         conversationId: "same",
       }),
     ).toEqual(targets[1]);
+  });
+
+  test("pickTarget matches the complete WEB conversation ID", () => {
+    const conversationId = "WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef";
+    const targets = [
+      { targetId: "other", type: "page", url: "https://chatgpt.com/c/WEB:other" },
+      { targetId: "submitted", type: "page", url: `https://chatgpt.com/c/${conversationId}` },
+    ];
+
+    expect(pickTarget(targets, { conversationId })).toEqual(targets[1]);
   });
 
   test("pickTarget understands CDP list ids", () => {

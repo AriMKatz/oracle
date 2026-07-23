@@ -13,6 +13,7 @@ import {
   STOP_BUTTON_SELECTOR,
 } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import { buildConversationIdReadExpression } from "../conversationIdentity.js";
 import { delay } from "../utils.js";
 import { isDeepResearchIncompleteText } from "../deepResearchResult.js";
 import { buildClickDispatcher } from "./domEvents.js";
@@ -363,7 +364,7 @@ function buildDeepResearchSubmittedUserTurnExpression(
     if (protocol !== 'https:' || !allowedHostname || (port && port !== '443')) {
       return { conversationId: null, unavailable: true, reason: 'origin-unavailable' };
     }
-    const conversationId = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null;
+    const conversationId = ${buildConversationIdReadExpression("String(location.pathname || '')")};
     if (conversationId !== expectedConversationId) {
       return { conversationId, changed: true };
     }
@@ -449,10 +450,9 @@ function buildDeepResearchSubmittedUserTurnExpression(
     } finally {
       clearTimeout(timeout);
     }
-    if (
-      (String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null) !==
-      expectedConversationId
-    ) return { conversationId: null, changed: true };
+    if (${buildConversationIdReadExpression("String(location.pathname || '')")} !== expectedConversationId) {
+      return { conversationId: null, changed: true };
+    }
 
     const mapping = record?.mapping;
     if (!mapping || typeof mapping !== 'object') {
@@ -1853,8 +1853,7 @@ function buildDeepResearchConversationRecordMetadataExpression(
       const port = String(location.port || '');
       const allowedHostname = hostname === 'chatgpt.com' || hostname === 'chat.openai.com';
       if (protocol !== 'https:' || !allowedHostname || (port && port !== '443')) return null;
-      const conversationMatch = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/);
-      const conversationId = conversationMatch?.[1] || null;
+      const conversationId = ${buildConversationIdReadExpression("String(location.pathname || '')")};
       if (
         !conversationId ||
         (expectedConversationId && conversationId !== expectedConversationId) ||
@@ -2138,8 +2137,9 @@ function buildDeepResearchConversationRecordMetadataExpression(
           || finalDomBinding.reportTransientKey !== initialDomBinding.reportTransientKey
         ) return null;
       }
-      const finalConversationMatch = String(location.pathname || '').match(/\\/c\\/([^/?#]+)/);
-      if (finalConversationMatch?.[1] !== conversationId) return null;
+      if (${buildConversationIdReadExpression("String(location.pathname || '')")} !== conversationId) {
+        return null;
+      }
       return {
         messageId: ownerMessageId,
         finalMessageId: asString(finalAssistant?.message?.id),
@@ -3221,7 +3221,7 @@ function buildDeepResearchCompletionPollExpression(minTurnIndex: number): string
     const MIN_TURN_INDEX = ${minTurnIndex};
     const conversationId = typeof location === 'undefined'
       ? null
-      : (String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null);
+      : ${buildConversationIdReadExpression("String(location.pathname || '')")};
     const stopVisible = Boolean(document.querySelector(${stopSelector}));
     const scopedToNewTurns = MIN_TURN_INDEX >= 0;
     const pageText = String(document.body?.innerText || '').toLowerCase().replace(/\\s+/g, ' ');

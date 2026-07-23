@@ -5,6 +5,10 @@ import type {
   BrowserResearchMode,
   ChromeClient,
 } from "../types.js";
+import {
+  buildConversationIdReadExpression,
+  extractConversationIdFromUrl,
+} from "../conversationIdentity.js";
 
 export interface BrowserArchiveDecision {
   mode: BrowserArchiveMode;
@@ -120,8 +124,7 @@ function extractArchiveConversationId(url?: string | null): string | undefined {
     const parsed = new URL(url ?? "");
     const hostname = parsed.hostname.toLowerCase();
     if (hostname !== "chatgpt.com" && hostname !== "chat.openai.com") return undefined;
-    const match = parsed.pathname.match(/^\/c\/([^/?#]+)(?:[/?#]|$)/);
-    return match?.[1] ? decodeURIComponent(match[1]) : undefined;
+    return extractConversationIdFromUrl(parsed.pathname);
   } catch {
     return undefined;
   }
@@ -136,7 +139,7 @@ function buildArchiveConversationExpression(expectedConversationId?: string): st
     const conversationUrl = typeof location === 'object' ? location.href : null;
     const expectedConversationId = ${JSON.stringify(expectedConversationId ?? null)};
     const currentConversationId = () =>
-      String(location.pathname || '').match(/\\/c\\/([^/?#]+)/)?.[1] || null;
+      ${buildConversationIdReadExpression("String(location.pathname || '')")};
     const isExpectedConversation = () =>
       Boolean(expectedConversationId) && currentConversationId() === expectedConversationId;
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

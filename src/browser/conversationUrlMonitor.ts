@@ -1,4 +1,5 @@
 import type { BrowserLogger } from "./types.js";
+import { isConversationUrl } from "./conversationIdentity.js";
 import { delay } from "./utils.js";
 
 export interface ConversationUrlMonitor {
@@ -75,8 +76,4 @@ export function createConversationUrlMonitor(options: {
       await Promise.allSettled(activePersists);
     },
   };
-}
-
-function isConversationUrl(url: string): boolean {
-  return /\/c\/[a-z0-9-]+/i.test(url);
 }

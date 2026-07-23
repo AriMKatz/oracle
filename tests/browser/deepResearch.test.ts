@@ -360,6 +360,7 @@ describe("Deep Research iframe helpers", () => {
   });
 
   it("captures the exact submitted Deep Research user record message ID", async () => {
+    const conversationId = "WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef";
     const messageNode = {
       getAttribute: (name: string) => (name === "data-message-id" ? "user-message-exact" : null),
     };
@@ -394,7 +395,7 @@ describe("Deep Research iframe helpers", () => {
       });
     const result = await new vm.Script(
       buildDeepResearchSubmittedUserTurnExpressionForTest(
-        "conversation-id",
+        conversationId,
         0,
         "Test scientific prompt",
       ),
@@ -408,13 +409,13 @@ describe("Deep Research iframe helpers", () => {
         protocol: "https:",
         hostname: "chatgpt.com",
         port: "",
-        pathname: "/c/conversation-id",
+        pathname: `/c/${conversationId}`,
       },
       setTimeout,
     });
 
     expect(result).toEqual({
-      conversationId: "conversation-id",
+      conversationId,
       messageId: "user-message-exact",
       turnIndex: 0,
     });

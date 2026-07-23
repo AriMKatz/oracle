@@ -1,6 +1,7 @@
 import { COOKIE_URLS } from "./constants.js";
 import type { BrowserLogger, ChromeClient, CookieParam } from "./types.js";
 import { delay } from "./utils.js";
+import { extractConversationIdFromUrl } from "./conversationIdentity.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 
 export class ChromeCookieSyncError extends Error {}
@@ -214,7 +215,7 @@ function extractChatGptConversationId(url: string): string | undefined {
     if (domain !== "chatgpt.com" && domain !== "chat.openai.com") {
       return undefined;
     }
-    return parsed.pathname.match(/\/c\/([a-zA-Z0-9-]+)/)?.[1];
+    return extractConversationIdFromUrl(parsed.pathname);
   } catch {
     return undefined;
   }
