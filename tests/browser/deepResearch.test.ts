@@ -36,6 +36,7 @@ import {
   pickPreferredDeepResearchReadForTest,
   shouldSkipDeepResearchTargetForTest,
   waitForResearchPlanAutoConfirm,
+  waitForDeepResearchSubmittedUserTurn,
   waitForDeepResearchCompletion,
   checkDeepResearchStatus,
 } from "../../src/browser/actions/deepResearch.js";
@@ -418,6 +419,70 @@ describe("Deep Research iframe helpers", () => {
       conversationId,
       messageId: "user-message-exact",
       turnIndex: 0,
+    });
+  });
+
+  it("does not misreport an empty Runtime evaluation as a conversation change", async () => {
+    const conversationId = "WEB:45519d39-e8cd-4d24-9308-edee27f590f4";
+    const runtime = {
+      evaluate: vi
+        .fn()
+        .mockResolvedValueOnce({
+          result: {},
+          exceptionDetails: {
+            text: "Uncaught",
+            exception: { description: "Error: transient evaluation failure" },
+          },
+        })
+        .mockResolvedValueOnce({
+          result: {
+            value: {
+              conversationId,
+              messageId: "submitted-user-message",
+              turnIndex: 0,
+            },
+          },
+        }),
+    } as unknown as Parameters<typeof waitForDeepResearchSubmittedUserTurn>[0];
+
+    await expect(
+      waitForDeepResearchSubmittedUserTurn(
+        runtime,
+        conversationId,
+        0,
+        "Synthetic research prompt",
+        1_000,
+      ),
+    ).resolves.toEqual({ messageId: "submitted-user-message", turnIndex: 0 });
+  });
+
+  it("reports the exact expected and observed IDs for a real conversation change", async () => {
+    const expectedConversationId = "WEB:45519d39-e8cd-4d24-9308-edee27f590f4";
+    const runtime = {
+      evaluate: vi.fn().mockResolvedValue({
+        result: {
+          value: {
+            conversationId: "WEB:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            changed: true,
+          },
+        },
+      }),
+    } as unknown as Parameters<typeof waitForDeepResearchSubmittedUserTurn>[0];
+
+    await expect(
+      waitForDeepResearchSubmittedUserTurn(
+        runtime,
+        expectedConversationId,
+        0,
+        "Synthetic research prompt",
+        1_000,
+      ),
+    ).rejects.toMatchObject({
+      details: {
+        code: "deep-research-conversation-changed",
+        expectedConversationId,
+        observedConversationId: "WEB:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      },
     });
   });
 
@@ -4536,8 +4601,50 @@ describe("waitForDeepResearchCompletion", () => {
         },
       ),
     ).rejects.toMatchObject({
-      details: { code: "deep-research-conversation-changed" },
+      details: {
+        code: "deep-research-conversation-changed",
+        expectedConversationId: "conversation-a",
+        observedConversationId: "conversation-b",
+      },
     });
+  });
+
+  it("retries an empty progress evaluation instead of reporting a conversation change", async () => {
+    mockRuntime.evaluate
+      .mockResolvedValueOnce({
+        result: {},
+        exceptionDetails: { text: "Execution context was destroyed" },
+      })
+      .mockResolvedValue({
+        result: {
+          value: {
+            finished: false,
+            stopVisible: true,
+            textLength: 500,
+            hasIframe: true,
+            conversationId: "conversation-id",
+          },
+        },
+      });
+
+    await expect(
+      waitForDeepResearchCompletion(
+        mockRuntime as never,
+        mockLogger,
+        100,
+        1,
+        undefined,
+        undefined,
+        {
+          targetBaselineCaptured: true,
+          expectedConversationId: "conversation-id",
+          expectedUserMessageId: "user-message",
+        },
+      ),
+    ).rejects.toMatchObject({ details: { code: "deep-research-timeout" } });
+    expect(mockLogger).toHaveBeenCalledWith(
+      "Deep Research progress probe was temporarily unavailable; retrying.",
+    );
   });
 
   it("throws on timeout with metadata", async () => {

@@ -43,7 +43,10 @@ name an Instant model. Do not require them to equal Pro, relabel them as Pro,
 or infer a different model role from them. The saved runtime must also pin the
 exact submitted conversation and the exact authenticated conversation-record
 user message ID plus its pre-submit turn-boundary index that own the report;
-prompt text alone is not identity evidence.
+prompt text alone is not identity evidence. If ChatGPT first exposes a
+transient `WEB:*` conversation identity after submission, retain it separately
+and accept only its one-way promotion on the same browser target to the
+canonical conversation before binding that exact user record.
 
 If browser authentication or picker selection fails, stop. For a normal
 response, also stop if exact returned-DOM verification fails. A completed Deep

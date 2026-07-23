@@ -598,6 +598,19 @@ describe("ensureChatMode", () => {
     expect(expression).toContain("node.classList.contains('shrink-0')");
     expect(expression).not.toContain("document.body.innerText");
   });
+
+  test("matches the active sidebar conversation by its complete WEB path segment", () => {
+    const conversationId = "WEB:45519d39-e8cd-4d24-9308-edee27f590f4";
+
+    expect(
+      runConversationModeProbe(`/c/${conversationId}`, [
+        {
+          href: `/c/${conversationId}`,
+          ariaLabel: "Workbench component research, Chat",
+        },
+      ]),
+    ).toEqual({ status: "chat-conversation" });
+  });
 });
 
 describe("waitForResumedConversationHydration", () => {

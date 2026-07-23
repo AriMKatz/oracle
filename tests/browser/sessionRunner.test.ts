@@ -76,6 +76,8 @@ describe("runBrowserSessionExecution", () => {
         answerChars: 20,
         copiedProfileRoot: "/tmp",
         conversationId: "foo",
+        provisionalTabUrl: "https://chatgpt.com/c/WEB:provisional",
+        provisionalConversationId: "WEB:provisional",
         submittedUserMessageId: "user-message-1",
         submittedUserTurnIndex: 1,
         assistantTurn: {
@@ -128,6 +130,8 @@ describe("runBrowserSessionExecution", () => {
       chromePid: undefined,
       copiedProfileRoot: "/tmp",
       conversationId: "foo",
+      provisionalTabUrl: "https://chatgpt.com/c/WEB:provisional",
+      provisionalConversationId: "WEB:provisional",
       submittedUserMessageId: "user-message-1",
       submittedUserTurnIndex: 1,
       assistantTurn: {

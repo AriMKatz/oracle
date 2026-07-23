@@ -123,6 +123,10 @@ export interface BrowserRuntimeMetadata {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
+  /** Initial transient WEB:* identity observed before ChatGPT assigned the canonical conversation. */
+  provisionalTabUrl?: string;
+  /** Initial transient WEB:* conversation identity retained as submission provenance. */
+  provisionalConversationId?: string;
   /** True after Oracle has submitted the prompt to ChatGPT. */
   promptSubmitted?: boolean;
   /** Exact authenticated ChatGPT record ID for the user turn submitted by Oracle. */

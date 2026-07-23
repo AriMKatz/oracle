@@ -8,6 +8,7 @@ import {
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import { buildConversationIdReadExpression } from "../conversationIdentity.js";
 import { buildThinkingActivePredicateJs, readThinkingActivity } from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
@@ -868,7 +869,7 @@ function buildAssistantSnapshotExpression(
     const MIN_TURN_INDEX = ${minTurnLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     const currentHref = typeof location === 'object' && location.href ? location.href : '';
-    const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+    const currentConversationId = ${buildConversationIdReadExpression("currentHref")};
     if (
       EXPECTED_CONVERSATION_ID &&
       currentConversationId &&
@@ -932,7 +933,7 @@ function buildResponseObserverExpression(
     const settleDelayMs = 800;
     const currentConversationId = () => {
       const href = typeof location === 'object' && location.href ? location.href : '';
-      return href.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+      return ${buildConversationIdReadExpression("href")};
     };
     const matchesExpectedConversation = () => {
       if (!EXPECTED_CONVERSATION_ID) return true;

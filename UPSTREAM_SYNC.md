@@ -71,11 +71,14 @@ The fork owns the local execution contract:
   `gpt-5-6-pro`; the owner or resolved slug may name a different model, and no
   recorded field may be assigned a model role other than the one ChatGPT
   recorded;
-- a Deep Research run must freeze the first post-submission conversation ID
-  and persist the exact authenticated conversation-record user message ID and
-  pre-submit DOM turn-boundary index; completion and reattach must require that
-  exact conversation/user chain rather than reconstruct identity from prompt
-  text;
+- a Deep Research run must persist the first post-submission `WEB:*` identity
+  when ChatGPT exposes one as provisional, allow at most one same-target
+  promotion to the subsequently observed non-`WEB` canonical conversation,
+  retain both identities, and bind the exact authenticated conversation-record
+  user message ID and pre-submit DOM turn-boundary index to that canonical
+  conversation; every other identity transition fails closed, and completion
+  and reattach require that exact conversation/user chain rather than
+  reconstructing identity from prompt text;
 - the Deep Research terminal message ID must be preserved; it may equal the
   outer owner ID when the owner is itself terminal, or identify the later
   terminal assistant message on the same active branch;

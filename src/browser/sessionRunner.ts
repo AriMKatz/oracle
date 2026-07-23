@@ -352,6 +352,8 @@ export async function runBrowserSessionExecution(
       chromeTargetId: browserResult.chromeTargetId,
       tabUrl: browserResult.tabUrl,
       conversationId: browserResult.conversationId,
+      provisionalTabUrl: browserResult.provisionalTabUrl,
+      provisionalConversationId: browserResult.provisionalConversationId,
       promptSubmitted: browserResult.promptSubmitted,
       submittedUserMessageId: browserResult.submittedUserMessageId,
       submittedUserTurnIndex: browserResult.submittedUserTurnIndex,

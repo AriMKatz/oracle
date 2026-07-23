@@ -4,6 +4,7 @@ import {
   buildConversationIdReadExpression,
   extractConversationIdFromUrl,
   isConversationUrl,
+  isProvisionalWebConversationId,
 } from "../../src/browser/conversationIdentity.js";
 
 const WEB_ID = "WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef";
@@ -27,5 +28,12 @@ describe("ChatGPT conversation identity", () => {
       JSON.stringify(`/c/${encodeURIComponent(WEB_ID)}`),
     );
     expect(new vm.Script(expression).runInNewContext()).toBe(WEB_ID);
+  });
+
+  test("classifies only WEB-prefixed identities as provisional", () => {
+    expect(isProvisionalWebConversationId(WEB_ID)).toBe(true);
+    expect(isProvisionalWebConversationId("web:temporary")).toBe(true);
+    expect(isProvisionalWebConversationId("45519d39-e8cd-4d24-9308-edee27f590f4")).toBe(false);
+    expect(isProvisionalWebConversationId(undefined)).toBe(false);
   });
 });

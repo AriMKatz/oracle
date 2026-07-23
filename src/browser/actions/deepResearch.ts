@@ -617,7 +617,7 @@ export async function waitForDeepResearchSubmittedUserTurn(
   const deadline = Date.now() + timeoutMs;
   let lastDiagnostic: Record<string, unknown> | undefined;
   do {
-    const { result } = await Runtime.evaluate({
+    const { result, exceptionDetails } = await Runtime.evaluate({
       expression: buildDeepResearchSubmittedUserTurnExpression(
         expectedConversationId,
         minTurnIndex,
@@ -645,10 +645,34 @@ export async function waitForDeepResearchSubmittedUserTurn(
           promptDomMatchCount?: number;
         }
       | undefined;
-    if (value?.changed || value?.conversationId !== expectedConversationId) {
+    if (!value) {
+      const exception = exceptionDetails as
+        | { text?: string; exception?: { description?: string } }
+        | undefined;
+      lastDiagnostic = {
+        reason: exceptionDetails
+          ? "submitted-user-turn-evaluation-exception"
+          : "submitted-user-turn-evaluation-empty",
+        ...(exception?.text ? { exceptionText: exception.text } : {}),
+        ...(exception?.exception?.description
+          ? { exceptionDescription: exception.exception.description }
+          : {}),
+      };
+      await delay(100);
+      continue;
+    }
+    if (
+      value.changed === true ||
+      (typeof value.conversationId === "string" && value.conversationId !== expectedConversationId)
+    ) {
       throw new BrowserAutomationError(
         "ChatGPT left the submitted Deep Research conversation before its exact user turn could be bound.",
-        { stage: "deep-research-scope", code: "deep-research-conversation-changed" },
+        {
+          stage: "deep-research-scope",
+          code: "deep-research-conversation-changed",
+          expectedConversationId,
+          observedConversationId: value.conversationId ?? null,
+        },
       );
     }
     if (
@@ -785,7 +809,7 @@ export async function waitForDeepResearchCompletion(
   logger(`Monitoring Deep Research (timeout: ${Math.round(timeoutMs / 60_000)}min)...`);
 
   while (Date.now() - start < timeoutMs) {
-    const { result } = await Runtime.evaluate({
+    const { result, exceptionDetails } = await Runtime.evaluate({
       expression: buildDeepResearchCompletionPollExpression(minTurnLiteral),
       returnByValue: true,
     });
@@ -804,10 +828,27 @@ export async function waitForDeepResearchCompletion(
         }
       | undefined;
 
-    if (options?.expectedConversationId && val?.conversationId !== options.expectedConversationId) {
+    if (!val) {
+      if (exceptionDetails) {
+        logger("Deep Research progress probe was temporarily unavailable; retrying.");
+      }
+      await delay(DEEP_RESEARCH_POLL_INTERVAL_MS);
+      continue;
+    }
+
+    if (
+      options?.expectedConversationId &&
+      typeof val.conversationId === "string" &&
+      val.conversationId !== options.expectedConversationId
+    ) {
       throw new BrowserAutomationError(
         "ChatGPT navigated away from the submitted Deep Research conversation; refusing to read another conversation's report.",
-        { stage: "deep-research-scope", code: "deep-research-conversation-changed" },
+        {
+          stage: "deep-research-scope",
+          code: "deep-research-conversation-changed",
+          expectedConversationId: options.expectedConversationId,
+          observedConversationId: val.conversationId,
+        },
       );
     }
 

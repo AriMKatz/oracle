@@ -42,6 +42,32 @@ describe("createConversationUrlMonitor", () => {
     );
   });
 
+  test("persists a provisional URL while waiting for an accepted canonical URL", async () => {
+    const provisional = "https://chatgpt.com/c/WEB:provisional";
+    const canonical = "https://chatgpt.com/c/canonical";
+    const readUrl = vi
+      .fn<() => Promise<string>>()
+      .mockResolvedValueOnce(provisional)
+      .mockResolvedValue(canonical);
+    const persistUrl = vi.fn(async () => {});
+    let now = 0;
+    const monitor = createConversationUrlMonitor({
+      readUrl,
+      persistUrl,
+      logger: vi.fn() as BrowserLogger,
+      wait: async () => {
+        now += 250;
+      },
+      now: () => now,
+    });
+
+    await expect(
+      monitor.update("post-submit-canonical", 1_000, (url) => url === canonical),
+    ).resolves.toBe(true);
+    expect(persistUrl).toHaveBeenNthCalledWith(1, provisional);
+    expect(persistUrl).toHaveBeenNthCalledWith(2, canonical);
+  });
+
   test("keeps polling through read errors until the URL appears", async () => {
     let reads = 0;
     const persistUrl = vi.fn(async () => {});

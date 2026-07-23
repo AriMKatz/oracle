@@ -3,7 +3,11 @@ import { isConversationUrl } from "./conversationIdentity.js";
 import { delay } from "./utils.js";
 
 export interface ConversationUrlMonitor {
-  update: (label: string, timeoutMs?: number) => Promise<boolean>;
+  update: (
+    label: string,
+    timeoutMs?: number,
+    acceptUrl?: (url: string) => boolean,
+  ) => Promise<boolean>;
   schedule: (label: string, timeoutMs?: number) => Promise<boolean>;
   isInFlight: () => boolean;
   stop: () => Promise<void>;
@@ -24,8 +28,13 @@ export function createConversationUrlMonitor(options: {
   let stopped = false;
   const activePersists = new Set<Promise<void>>();
 
-  const update = async (label: string, timeoutMs = 10_000): Promise<boolean> => {
+  const update = async (
+    label: string,
+    timeoutMs = 10_000,
+    acceptUrl?: (url: string) => boolean,
+  ): Promise<boolean> => {
     const startedAt = now();
+    let lastPersistedUrl: string | undefined;
     while (!stopped && now() - startedAt < timeoutMs) {
       try {
         const url = await options.readUrl();
@@ -33,15 +42,20 @@ export function createConversationUrlMonitor(options: {
           return false;
         }
         if (url && isConversationUrl(url)) {
-          options.logger(`[browser] conversation url (${label}) = ${url}`);
-          const persist = options.persistUrl(url);
-          activePersists.add(persist);
-          try {
-            await persist;
-          } finally {
-            activePersists.delete(persist);
+          if (url !== lastPersistedUrl) {
+            const persist = options.persistUrl(url);
+            activePersists.add(persist);
+            try {
+              await persist;
+              lastPersistedUrl = url;
+            } finally {
+              activePersists.delete(persist);
+            }
           }
-          return true;
+          if (!acceptUrl || acceptUrl(url)) {
+            options.logger(`[browser] conversation url (${label}) = ${url}`);
+            return true;
+          }
         }
       } catch {
         // The page can navigate or disconnect between polls; keep trying until timeout.

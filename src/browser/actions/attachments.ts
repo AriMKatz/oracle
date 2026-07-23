@@ -2,6 +2,7 @@ import path from "node:path";
 import type { ChromeClient, BrowserAttachment, BrowserLogger } from "../types.js";
 import { INPUT_SELECTORS, SEND_BUTTON_SELECTORS, UPLOAD_STATUS_SELECTORS } from "../constants.js";
 import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import { buildConversationIdReadExpression } from "../conversationIdentity.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { transferAttachmentViaDataTransfer } from "./attachmentDataTransfer.js";
@@ -1816,7 +1817,7 @@ function buildUserTurnAttachmentExpression(options: {
     const EXPECTED_PROMPT_PREFIX = ${expectedPromptLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     const currentHref = typeof location === 'object' && location.href ? location.href : '';
-    const currentConversationId = currentHref.match(/\\/c\\/([a-zA-Z0-9-]+)/)?.[1] ?? null;
+    const currentConversationId = ${buildConversationIdReadExpression("currentHref")};
     if (
       EXPECTED_CONVERSATION_ID &&
       currentConversationId &&

@@ -26,6 +26,10 @@ export function isConversationUrl(url: string): boolean {
   return extractConversationIdFromUrl(url) !== undefined;
 }
 
+export function isProvisionalWebConversationId(conversationId: string | null | undefined): boolean {
+  return /^WEB:/i.test(String(conversationId ?? "").trim());
+}
+
 export function buildConversationIdReadExpression(valueExpression: string): string {
   const pattern = JSON.stringify(CHATGPT_CONVERSATION_PATH_SEGMENT_PATTERN);
   return `((value) => {

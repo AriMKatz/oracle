@@ -84,10 +84,13 @@ describe("Deep Research submission scope", () => {
     ).toBe("WEB:4006dc3c-d3c2-43d1-9391-1b5f51e324ef");
   });
 
-  test("freezes the first observed post-submit conversation ID", () => {
+  test("accepts only the same ID or a one-way WEB-to-canonical promotion", () => {
     expect(__test__.acceptsSubmittedConversationId(undefined, "submitted")).toBe(true);
     expect(__test__.acceptsSubmittedConversationId("submitted", "submitted")).toBe(true);
     expect(__test__.acceptsSubmittedConversationId("submitted", "other")).toBe(false);
+    expect(__test__.acceptsSubmittedConversationId("WEB:provisional", "canonical")).toBe(true);
+    expect(__test__.acceptsSubmittedConversationId("WEB:first", "WEB:second")).toBe(false);
+    expect(__test__.acceptsSubmittedConversationId("canonical", "WEB:provisional")).toBe(false);
   });
 });
 

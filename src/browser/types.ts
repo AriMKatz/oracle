@@ -193,6 +193,10 @@ export interface BrowserRunResult {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
+  /** Initial transient WEB:* URL retained when ChatGPT later assigned a canonical conversation. */
+  provisionalTabUrl?: string;
+  /** Initial transient WEB:* identity retained as submission provenance. */
+  provisionalConversationId?: string;
   promptSubmitted?: boolean;
   submittedUserMessageId?: string;
   submittedUserTurnIndex?: number;

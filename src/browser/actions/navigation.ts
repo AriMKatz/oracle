@@ -8,7 +8,10 @@ import {
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
-import { extractConversationIdFromUrl } from "../conversationIdentity.js";
+import {
+  buildConversationIdReadExpression,
+  extractConversationIdFromUrl,
+} from "../conversationIdentity.js";
 
 export function installJavaScriptDialogAutoDismissal(
   Page: ChromeClient["Page"],
@@ -201,8 +204,7 @@ function buildChatModeProbeExpression(): string {
       node?.getAttribute?.('aria-checked') === 'true' ||
       node?.getAttribute?.('data-state') === 'on';
     const conversationIdFromPath = (value) => {
-      const match = String(value || '').match(/\\/c\\/([a-zA-Z0-9-]+)/);
-      return match?.[1] || null;
+      return ${buildConversationIdReadExpression("value")};
     };
     const isStructuredWorkBadge = (node) =>
       node instanceof HTMLElement &&

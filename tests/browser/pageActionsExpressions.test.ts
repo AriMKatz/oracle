@@ -1,3 +1,4 @@
+import vm from "node:vm";
 import { describe, expect, test } from "vitest";
 import {
   buildAssistantExtractorForTest,
@@ -158,5 +159,29 @@ describe("browser automation expressions", () => {
     expect(expression).toContain("const textPrefix = text.slice");
     expect(expression).toContain("text.length > 0");
     expect(expression).toContain("textPrefix.length > 0");
+  });
+
+  test("user-turn attachment verification preserves a complete WEB conversation ID", () => {
+    const conversationId = "WEB:45519d39-e8cd-4d24-9308-edee27f590f4";
+    const expression = buildUserTurnAttachmentExpressionForTest({
+      expectedConversationId: conversationId,
+    });
+    const result = new vm.Script(expression).runInNewContext({
+      document: { querySelectorAll: () => [] },
+      location: { href: `https://chatgpt.com/c/${conversationId}` },
+    });
+
+    expect(result).toEqual({ ok: false });
+    expect(expression).not.toContain("[a-zA-Z0-9-]+");
+  });
+
+  test("assistant snapshots use the shared full path-segment conversation parser", () => {
+    const expression = buildAssistantSnapshotExpressionForTest(
+      0,
+      "WEB:45519d39-e8cd-4d24-9308-edee27f590f4",
+    );
+
+    expect(expression).toContain("[^/?#]+");
+    expect(expression).not.toContain("[a-zA-Z0-9-]+");
   });
 });
